@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TONE3000 sign-in</title>
+<style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#0b0e15;color:#e8ecf4;font:15px system-ui,sans-serif}</style>
+</head>
+<body>
+<p id="msg">Returning to DawSynthDoom…</p>
+<script>
+  // Relays the TONE3000 OAuth result back to the mixer window, then closes.
+  (function () {
+    var p = new URLSearchParams(location.search);
+    var message = {
+      type: 't3k_oauth_callback',
+      code: p.get('code'),
+      state: p.get('state'),
+      error: p.get('error'),
+      tone_id: p.get('tone_id'),
+      canceled: p.get('canceled') === 'true'
+    };
+    if (window.opener) {
+      window.opener.postMessage(message, location.origin);
+    } else if ('BroadcastChannel' in window) {
+      var bc = new BroadcastChannel('t3k_oauth');
+      bc.postMessage(message);
+      bc.close();
+    }
+    setTimeout(function () {
+      window.close();
+      document.getElementById('msg').textContent = 'Done — you can close this window.';
+    }, 150);
+  })();
+</script>
+</body>
+</html>
