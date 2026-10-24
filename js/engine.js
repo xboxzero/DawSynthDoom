@@ -37,7 +37,7 @@ function smooth(param, value, ctx, t = 0.02) {
   param.setTargetAtTime(value, ctx.currentTime, t);
 }
 
-function makeCurve(type, drive) {
+export function makeCurve(type, drive) {
   const n = 2048;
   const c = new Float32Array(n);
   const k = 1 + drive * 50;
@@ -55,7 +55,7 @@ function makeCurve(type, drive) {
   return c;
 }
 
-function ampCurve() {
+export function ampCurve() {
   const n = 2048;
   const c = new Float32Array(n);
   for (let i = 0; i < n; i++) {
@@ -66,7 +66,7 @@ function ampCurve() {
   return c;
 }
 
-function makeReverbIR(ctx, seconds, damp) {
+export function makeReverbIR(ctx, seconds, damp) {
   const rate = ctx.sampleRate;
   const len = Math.max(1, Math.floor(rate * seconds));
   const buf = ctx.createBuffer(2, len, rate);
@@ -83,7 +83,7 @@ function makeReverbIR(ctx, seconds, damp) {
   return buf;
 }
 
-async function makeCabIR(rate) {
+export async function makeCabIR(rate) {
   // A synthetic 1x12/4x12-ish cabinet response, rendered offline.
   const len = 2048;
   const off = new OfflineAudioContext(1, len, rate);

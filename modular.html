@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0e15">
+<title>DawSynthDoom Patch</title>
+<meta name="description" content="Web modular synthesizer with TouchDesigner-style audio-reactive visual nodes.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b0e15'/%3E%3Ccircle cx='18' cy='20' r='7' fill='%23ff7a2f'/%3E%3Ccircle cx='46' cy='44' r='7' fill='%2339d5ff'/%3E%3Cpath d='M24 20 C40 20 24 44 40 44' fill='none' stroke='%23ffd23f' stroke-width='5'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+<link rel="stylesheet" href="css/modular.css">
+</head>
+<body class="modular">
+<header class="top">
+  <div class="brand"><span class="logo">◢◤</span> DAW<b>SYNTH</b>DOOM <span class="sub">PATCH</span></div>
+  <a class="btn" href="index.html">← MIXER</a>
+  <button id="addBtn" class="btn accent" type="button">+ ADD</button>
+  <select id="patchSel" aria-label="Patches"></select>
+  <div class="actions">
+    <div class="seg-group">
+      <button id="zoomOut" class="btn seg" type="button" aria-label="Zoom out">−</button>
+      <span id="zoomLabel" class="zoom-label">100%</span>
+      <button id="zoomIn" class="btn seg" type="button" aria-label="Zoom in">+</button>
+    </div>
+    <button id="fitBtn" class="btn ghost" type="button">FIT</button>
+    <button id="viewerBtn" class="btn ghost" type="button">VIEWER</button>
+    <button id="panicBtn" class="btn ghost" type="button">MUTE</button>
+  </div>
+  <input id="patchFile" type="file" accept=".json,application/json" hidden>
+</header>
+
+<div class="m-layout">
+  <aside id="palette" aria-label="Modules"></aside>
+  <div id="stage">
+    <div id="world"><svg id="wires" width="1" height="1"></svg></div>
+    <div class="legend">
+      <span style="--k:#ff7a2f">audio</span><span style="--k:#ffd23f">cv</span><span style="--k:#ff3b5c">gate</span><span style="--k:#1fd18b">data</span><span style="--k:#39d5ff">texture</span>
+    </div>
+  </div>
+  <div id="viewer">
+    <canvas id="viewerCanvas" aria-label="Visual output"></canvas>
+    <button id="fullBtn" class="btn small" type="button">⛶ FULLSCREEN</button>
+  </div>
+</div>
+
+<div id="startOverlay" class="overlay">
+  <div class="ov-card">
+    <h1>Modular synth + visual patcher</h1>
+    <p>Patch oscillators, filters, envelopes, NAM amps, your live input and TouchDesigner-style shader nodes together with cables.</p>
+    <ul class="hint">
+      <li>Drag from an <b>output dot</b> (right side) to an <b>input dot</b> (left side) to connect.</li>
+      <li>Grab a connected input dot to move that cable. Tap a cable twice to delete it.</li>
+      <li>Drag the background to pan. Pinch or use the wheel to zoom.</li>
+      <li>Double-tap a knob to reset it. Use headphones with live input.</li>
+    </ul>
+    <button id="startBtn" class="btn start big" type="button">▶ START PATCHING</button>
+  </div>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+<script type="module" src="js/modular/main.js"></script>
+</body>
+</html>
