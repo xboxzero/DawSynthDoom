@@ -1,33 +1,29 @@
 import { Registry } from './params.js';
-import { knob, fader, toggle, button, hslider, drawMeter, el } from './ui.js';
-import { Engine, STRIPS, EQ_BANDS, faderGain } from './engine.js';
-import { Scope, noteName } from './scope.js';
-import { EqEditor, BAND_COLORS } from './eq.js';
-import { Automation, Scenes } from './automation.js';
+import { knob, fader, toggle, button, drawMeter, el } from './ui.js';
+import { Engine, WETS, PRE_BANDS, EQ_BANDS, faderGain } from './engine.js';
+import { EqEditor } from './eq.js';
+import { SdrDisplay } from './sdr.js';
+import { QubitChaos, CHAOS_TARGETS } from './chaos.js';
+import { RACK_MODULES } from './rack.js';
 import { Tone3000, redirectUri } from './tone3000.js';
 
 const $ = (s) => document.querySelector(s);
-const STATE_KEY = 'dsd.state.v1';
+const STATE_KEY = 'dsd.state.v2';
 const STARTER_BASE = 'https://raw.githubusercontent.com/tone-3000/neural-amp-modeler-wasm/refs/heads/main/ui/public/';
 const STARTERS = {
-  nam: [
-    { name: 'Vox AC10', url: STARTER_BASE + 'models/ac10.nam' },
-    { name: 'Fender Deluxe Reverb', url: STARTER_BASE + 'models/deluxe.nam' },
-  ],
+  nam: [{ name: 'Vox AC10', url: STARTER_BASE + 'models/ac10.nam' }, { name: 'Fender Deluxe Reverb', url: STARTER_BASE + 'models/deluxe.nam' }],
   cab: [{ name: 'Celestion cab', url: STARTER_BASE + 'irs/celestion.wav' }],
   rev: [{ name: 'EMT 140 Plate', url: STARTER_BASE + 'irs/plate.wav' }],
 };
+const KEYS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 
 const reg = new Registry();
 const engine = new Engine(reg);
-const autom = new Automation(reg);
-const scenes = new Scenes(reg);
+const chaos = new QubitChaos();
 const t3k = new Tone3000();
-const strip = Object.fromEntries(STRIPS.map((s) => [s.id, s]));
-let selected = 'amp';
-let scopeSource = 'out';
+const on = () => engine.started;
+let pendingRack = null;
 
-// ───────────────────────── toast ─────────────────────────
 function toast(text, kind = '') {
   const t = el('div', `toast ${kind}`, $('#toasts'));
   t.textContent = text;
@@ -35,98 +31,104 @@ function toast(text, kind = '') {
   setTimeout(() => t.remove(), 4300);
 }
 
-// ───────────────────────── parameters ─────────────────────────
-const on = () => engine.started;
+const fmtFader = (v) => { const g = faderGain(v); return g <= 0 ? '-∞' : ((g >= 1 ? '+' : '') + (20 * Math.log10(g)).toFixed(1)); };
+const fmtPan = (v) => (Math.abs(v) < 0.02 ? 'C' : (v < 0 ? 'L' : 'R') + Math.round(Math.abs(v) * 100));
 const dB = { unit: 'dB' };
+const T = (fn) => (v) => on() && fn(v);
+const now = () => engine.ctx.currentTime;
 
+// ───────────────────────── parameters ─────────────────────────
 function defineParams() {
-  reg.define('in.trim', { label: 'INPUT', min: -24, max: 24, def: 0, ...dB, apply: (v) => on() && engine.inTrim.gain.setTargetAtTime(10 ** (v / 20), engine.ctx.currentTime, 0.02) });
+  reg.define('in.trim', { label: 'INPUT', min: -24, max: 24, def: 0, ...dB, apply: T((v) => engine.inTrim.gain.setTargetAtTime(10 ** (v / 20), now(), 0.02)) });
   reg.define('in.ch', { label: 'CHANNEL', min: 0, max: 2, def: 0, step: 1, options: ['IN 1', 'IN 2', '1+2'], apply: (v) => engine.applyChannel(v) });
+  reg.define('gate.on', { label: 'GATE', def: 1, step: 1, apply: T((v) => engine.setFront('gateOn', v)) });
+  reg.define('gate.thr', { label: 'THRESH', min: -80, max: -20, def: -56, ...dB, apply: T((v) => engine.setFront('gateThresh', 10 ** (v / 20))) });
 
-  reg.define('master.vol', { label: 'MASTER', def: 0.72, format: fmtFader, apply: (v) => on() && engine.master.gain.setTargetAtTime(faderGain(v), engine.ctx.currentTime, 0.015) });
-  reg.define('master.comp', { label: 'GLUE', def: 0.25, unit: '%', apply: (v) => on() && engine.setComp(v) });
-  reg.define('master.limit', { label: 'LIMIT', def: 1, step: 1, morph: false, apply: (v) => on() && engine.setLimiter(v >= 0.5) });
-  reg.define('master.mon', { label: 'MONITOR', def: 1, step: 1, morph: false, persist: false, apply: (v) => on() && engine.monitor.gain.setTargetAtTime(v >= 0.5 ? 1 : 0, engine.ctx.currentTime, 0.01) });
+  reg.define('pre.on', { label: 'PRE EQ', def: 1, step: 1, apply: () => applyPre() });
+  reg.define('pre.hp', { label: 'LOW CUT', min: 20, max: 400, def: 60, scale: 'log', unit: 'Hz', apply: T((v) => engine.preHp.frequency.setTargetAtTime(reg.get('pre.on') >= 0.5 ? v : 10, now(), 0.02)) });
+  PRE_BANDS.forEach((b, i) => {
+    reg.define(`pre.${i}.f`, { label: 'FREQ', min: 20, max: 20000, def: b.f, scale: 'log', unit: 'Hz', apply: () => applyPre(i) });
+    reg.define(`pre.${i}.g`, { label: 'GAIN', min: -18, max: 18, def: 0, ...dB, apply: () => applyPre(i) });
+    reg.define(`pre.${i}.q`, { label: 'Q', min: 0.3, max: 10, def: b.q, scale: 'log', apply: () => applyPre(i) });
+  });
 
-  reg.define('eq.on', { label: 'EQ', def: 1, step: 1, morph: false, apply: () => applyEq() });
+  const front = (name, map = (v) => v) => T((v) => engine.setFront(name, map(v)));
+  reg.define('tune.on', { label: 'AUTOTUNE', def: 0, step: 1, apply: front('tuneOn') });
+  reg.define('tune.key', { label: 'KEY', min: 0, max: 11, def: 9, step: 1, options: KEYS, apply: front('key') });
+  reg.define('tune.scale', { label: 'SCALE', min: 0, max: 5, def: 0, step: 1, options: ['CHROM', 'MAJOR', 'MINOR', 'PENT MAJ', 'PENT MIN', 'DORIAN'], apply: front('scale') });
+  reg.define('tune.temper', { label: 'TEMPERAMENT', min: 0, max: 4, def: 1, step: 1, options: ['EQUAL', 'WERCK III', 'KIRNB III', 'VALLOTTI', 'YOUNG II'], apply: front('temper') });
+  reg.define('tune.ref', { label: 'A4 REF', min: 415, max: 466, def: 440, step: 0.5, format: (v) => v.toFixed(1) + 'Hz', apply: front('ref') });
+  reg.define('tune.amount', { label: 'STRENGTH', def: 1, unit: '%', apply: front('amount') });
+  reg.define('tune.speed', { label: 'RETUNE', min: 0, max: 400, def: 40, format: (v) => Math.round(v) + 'ms', apply: front('speed') });
+  reg.define('tune.mix', { label: 'MIX', def: 1, unit: '%', apply: front('mix') });
+
+  const ampR = () => engine.applyAmpRouting();
+  const gainDb = (node) => T((v) => node().gain.setTargetAtTime(10 ** (v / 20), now(), 0.02));
+  const shelf = (node) => T((v) => node().gain.setTargetAtTime(v, now(), 0.02));
+  reg.define('amp.on', { label: 'AMP', def: 1, step: 1, apply: ampR });
+  reg.define('amp.boost', { label: 'BOOST', def: 0, step: 1, apply: T(() => engine.setBoost(reg.get('amp.boost') >= 0.5, reg.get('amp.drive'))) });
+  reg.define('amp.drive', { label: 'DRIVE', def: 0.35, unit: '%', apply: T(() => engine.setBoost(reg.get('amp.boost') >= 0.5, reg.get('amp.drive'))) });
+  reg.define('amp.gain', { label: 'GAIN', min: -24, max: 24, def: 0, ...dB, apply: gainDb(() => engine.ampPre) });
+  reg.define('amp.bass', { label: 'BASS', min: -12, max: 12, def: 0, ...dB, apply: shelf(() => engine.bass) });
+  reg.define('amp.mid', { label: 'MID', min: -12, max: 12, def: 0, ...dB, apply: shelf(() => engine.mid) });
+  reg.define('amp.treb', { label: 'TREBLE', min: -12, max: 12, def: 0, ...dB, apply: shelf(() => engine.treb) });
+  reg.define('amp.out', { label: 'OUTPUT', min: -24, max: 12, def: 0, ...dB, apply: gainDb(() => engine.ampLevel) });
+  reg.define('amp.cab', { label: 'CAB IR', def: 1, step: 1, apply: ampR });
+  reg.define('amp.norm', { label: 'NORMALIZE', def: 1, step: 1, apply: ampR });
+
+  reg.define('wdw.dry', { label: 'DRY', def: 0.79, format: fmtFader, apply: T((v) => engine.dryGain.gain.setTargetAtTime(faderGain(v), now(), 0.015)) });
+  reg.define('wdw.pos', { label: 'DRY POS', min: -1, max: 1, def: 0, format: fmtPan, apply: T((v) => engine.dryPan.pan.setTargetAtTime(v, now(), 0.02)) });
+  reg.define('wdw.wet', { label: 'WET', def: 0.72, format: fmtFader, apply: T((v) => engine.wetGain.gain.setTargetAtTime(faderGain(v), now(), 0.015)) });
+  reg.define('wdw.width', { label: 'WIDTH', min: 0, max: 2, def: 1.3, format: (v) => Math.round(v * 100) + '%', apply: T(() => engine.applyWidth()) });
+  reg.define('wdw.mode', { label: 'W/D/W', def: 1, step: 1, apply: T(() => engine.applyWidth()) });
+
+  const sends = { dly: 0.55, rev: 0.6, cho: 0, dbl: 0 };
+  for (const w of WETS) {
+    reg.define(`${w.id}.send`, { label: 'SEND', def: sends[w.id], format: fmtFader, apply: (v) => engine.setWetSend(w.id, v) });
+    reg.define(`${w.id}.mute`, { label: 'M', def: 0, step: 1, apply: (v) => engine.setWetMute(w.id, v >= 0.5) });
+  }
+  reg.define('dly.time', { label: 'TIME', min: 0.05, max: 1.5, def: 0.38, scale: 'log', unit: 's', apply: T(() => engine.applyDelayTime()) });
+  reg.define('dly.fb', { label: 'REPEATS', max: 0.85, def: 0.32, unit: '%', apply: T((v) => engine.setDelayFeedback(v)) });
+  reg.define('dly.tone', { label: 'TONE', min: 800, max: 12000, def: 4000, scale: 'log', unit: 'Hz', apply: T((v) => engine.wet.dly.tone.frequency.setTargetAtTime(v, now(), 0.02)) });
+  reg.define('dly.spread', { label: 'SPREAD', def: 0.3, unit: '%', apply: T(() => engine.applyDelayTime()) });
+  reg.define('rev.size', { label: 'SIZE', min: 0.4, max: 8, def: 2.6, scale: 'log', unit: 's', apply: T(() => engine.regenReverb()) });
+  reg.define('rev.pre', { label: 'PRE-DLY', min: 0, max: 0.2, def: 0.025, unit: 's', apply: T((v) => engine.wet.rev.pre.delayTime.setTargetAtTime(v, now(), 0.05)) });
+  reg.define('rev.tone', { label: 'TONE', min: 1000, max: 16000, def: 6500, scale: 'log', unit: 'Hz', apply: T((v) => engine.wet.rev.tone.frequency.setTargetAtTime(v, now(), 0.02)) });
+  reg.define('cho.rate', { label: 'RATE', min: 0.05, max: 6, def: 0.7, scale: 'log', format: (v) => v.toFixed(2) + 'Hz', apply: T(() => engine.setChorus()) });
+  reg.define('cho.depth', { label: 'DEPTH', def: 0.5, unit: '%', apply: T(() => engine.setChorus()) });
+  reg.define('cho.tone', { label: 'TONE', min: 1000, max: 16000, def: 9000, scale: 'log', unit: 'Hz', apply: T((v) => engine.wet.cho.tone.frequency.setTargetAtTime(v, now(), 0.02)) });
+  reg.define('dbl.time', { label: 'SPREAD', min: 0.006, max: 0.045, def: 0.018, unit: 's', apply: T(() => engine.setDoubler()) });
+
+  reg.define('chaos.on', { label: 'QUBIT CHAOS', def: 0, step: 1 });
+  reg.define('chaos.rate', { label: 'RATE', min: 0.02, max: 4, def: 0.25, scale: 'log', format: (v) => v.toFixed(2) + 'Hz' });
+  reg.define('chaos.entropy', { label: 'ENTROPY', def: 0.35, unit: '%' });
+  reg.define('chaos.entangle', { label: 'ENTANGLE', def: 0.5, unit: '%' });
+  reg.define('chaos.depth', { label: 'DEPTH', def: 0.5, unit: '%' });
+  reg.define('chaos.glide', { label: 'GLIDE', min: 0.02, max: 3, def: 0.4, scale: 'log', unit: 's' });
+  const chaosDefaults = { dly: 1, rev: 1, cho: 1, dbl: 1, width: 1, time: 0, filter: 0, master: 0 };
+  for (const t of CHAOS_TARGETS) reg.define(`chaos.t.${t.id}`, { label: t.label, def: chaosDefaults[t.id], step: 1 });
+
+  reg.define('eq.on', { label: 'EQ', def: 1, step: 1, apply: () => applyEq() });
   EQ_BANDS.forEach((b, i) => {
     reg.define(`eq.${i}.f`, { label: 'FREQ', min: 20, max: 20000, def: b.f, scale: 'log', unit: 'Hz', apply: () => applyEq(i) });
     reg.define(`eq.${i}.g`, { label: 'GAIN', min: -18, max: 18, def: 0, ...dB, apply: () => applyEq(i) });
     reg.define(`eq.${i}.q`, { label: 'Q', min: 0.3, max: 10, def: b.q, scale: 'log', apply: () => applyEq(i) });
   });
-
-  reg.define('mix.autolvl', { label: 'AUTO LEVEL', def: 0, step: 1, morph: false });
-  reg.define('mix.target', { label: 'TARGET', min: -36, max: -8, def: -20, ...dB });
-  reg.define('mix.morph', { label: 'A ⇄ B', def: 0, morph: false, apply: (v, src) => { if (src !== 'load') scenes.morph(v); } });
-  reg.define('mix.autoMorph', { label: 'AUTO MORPH', def: 0, step: 1, morph: false });
-  reg.define('mix.morphRate', { label: 'CYCLE', min: 2, max: 60, def: 16, scale: 'log', unit: 's' });
-  reg.define('auto.len', { label: 'LOOP', min: 2, max: 32, def: 8, step: 1, format: (v) => v + 's', apply: (v) => { autom.length = v; } });
-  reg.define('scope.zoom', { label: 'ZOOM', def: 0.45, morph: false, apply: (v) => { scope.zoom = v; } });
-
-  const levels = { dry: 0.62, amp: 0.79, drv: 0, dly: 0.5, rev: 0.5, mod: 0, syn: 0 };
-  for (const s of STRIPS) {
-    reg.define(`${s.id}.lvl`, { label: 'LEVEL', def: levels[s.id], format: fmtFader, apply: (v) => engine.setLevel(s.id, v) });
-    reg.define(`${s.id}.pan`, { label: 'PAN', min: -1, max: 1, def: 0, format: fmtPan, apply: (v) => engine.setPan(s.id, v) });
-    reg.define(`${s.id}.mute`, { label: 'M', def: 0, step: 1, morph: false, apply: () => engine.updateSolo() });
-    reg.define(`${s.id}.solo`, { label: 'S', def: 0, step: 1, morph: false, persist: false, apply: () => engine.updateSolo() });
-  }
-
-  const filt = (node) => (v) => on() && node().frequency.setTargetAtTime(v, engine.ctx.currentTime, 0.02);
-  const S = (id) => engine.strips[id];
-  reg.define('dry.lo', { label: 'LO CUT', min: 20, max: 600, def: 20, scale: 'log', unit: 'Hz', apply: filt(() => S('dry').lo) });
-  reg.define('dry.hi', { label: 'HI CUT', min: 1000, max: 20000, def: 20000, scale: 'log', unit: 'Hz', apply: filt(() => S('dry').hi) });
-
-  const gainDb = (node) => (v) => on() && node().gain.setTargetAtTime(10 ** (v / 20), engine.ctx.currentTime, 0.02);
-  const shelf = (node) => (v) => on() && node().gain.setTargetAtTime(v, engine.ctx.currentTime, 0.02);
-  reg.define('amp.gain', { label: 'GAIN', min: -24, max: 24, def: 0, ...dB, apply: gainDb(() => S('amp').pre) });
-  reg.define('amp.out', { label: 'OUTPUT', min: -24, max: 12, def: 0, ...dB, apply: gainDb(() => S('amp').out) });
-  reg.define('amp.bass', { label: 'BASS', min: -12, max: 12, def: 0, ...dB, apply: shelf(() => S('amp').bass) });
-  reg.define('amp.mid', { label: 'MID', min: -12, max: 12, def: 0, ...dB, apply: shelf(() => S('amp').mid) });
-  reg.define('amp.treb', { label: 'TREBLE', min: -12, max: 12, def: 0, ...dB, apply: shelf(() => S('amp').treb) });
-  reg.define('amp.cab', { label: 'CAB IR', def: 1, step: 1, morph: false, apply: () => on() && engine.setCab(reg.get('amp.cab') >= 0.5, reg.get('amp.cabMix')) });
-  reg.define('amp.cabMix', { label: 'CAB MIX', def: 1, unit: '%', apply: () => on() && engine.setCab(reg.get('amp.cab') >= 0.5, reg.get('amp.cabMix')) });
-  reg.define('amp.norm', { label: 'NORMALIZE', def: 1, step: 1, morph: false, apply: () => engine.applyAmpRouting() });
-
-  reg.define('drv.drive', { label: 'DRIVE', def: 0.45, unit: '%', apply: () => on() && engine.setDrive() });
-  reg.define('drv.tone', { label: 'TONE', min: 400, max: 12000, def: 3800, scale: 'log', unit: 'Hz', apply: filt(() => S('drv').tone) });
-  reg.define('drv.type', { label: 'TYPE', min: 0, max: 3, def: 0, step: 1, options: ['SOFT', 'HARD', 'FUZZ', 'FOLD'], apply: () => on() && engine.setDrive() });
-
-  const send = (id) => (v) => on() && engine.setSendSource(id, v >= 0.5);
-  reg.define('dly.time', { label: 'TIME', min: 0.03, max: 1.5, def: 0.38, scale: 'log', unit: 's', apply: (v) => on() && S('dly').delay.delayTime.setTargetAtTime(v, engine.ctx.currentTime, 0.05) });
-  reg.define('dly.fb', { label: 'FEEDBACK', max: 0.92, def: 0.35, unit: '%', apply: (v) => on() && S('dly').fb.gain.setTargetAtTime(v, engine.ctx.currentTime, 0.02) });
-  reg.define('dly.tone', { label: 'TONE', min: 500, max: 12000, def: 4500, scale: 'log', unit: 'Hz', apply: filt(() => S('dly').tone) });
-  reg.define('dly.src', { label: 'SEND', min: 0, max: 1, def: 1, step: 1, options: ['INPUT', 'AMP'], apply: send('dly') });
-
-  reg.define('rev.size', { label: 'SIZE', min: 0.4, max: 8, def: 2.4, scale: 'log', unit: 's', apply: () => on() && engine.regenReverb() });
-  reg.define('rev.pre', { label: 'PRE-DLY', min: 0, max: 0.2, def: 0.02, unit: 's', apply: (v) => on() && S('rev').pre.delayTime.setTargetAtTime(v, engine.ctx.currentTime, 0.05) });
-  reg.define('rev.tone', { label: 'TONE', min: 800, max: 16000, def: 6000, scale: 'log', unit: 'Hz', apply: filt(() => S('rev').tone) });
-  reg.define('rev.src', { label: 'SEND', min: 0, max: 1, def: 1, step: 1, options: ['INPUT', 'AMP'], apply: send('rev') });
-
-  reg.define('mod.rate', { label: 'RATE', min: 0.05, max: 8, def: 0.6, scale: 'log', unit: 'Hz', format: (v) => v.toFixed(2) + 'Hz', apply: () => on() && engine.setMod() });
-  reg.define('mod.depth', { label: 'DEPTH', def: 0.5, unit: '%', apply: () => on() && engine.setMod() });
-  reg.define('mod.fb', { label: 'FEEDBACK', max: 0.85, def: 0.1, unit: '%', apply: () => on() && engine.setMod() });
-  reg.define('mod.src', { label: 'SEND', min: 0, max: 1, def: 1, step: 1, options: ['INPUT', 'AMP'], apply: send('mod') });
-
-  const syn = (name, map = (v) => v) => (v) => on() && engine.setSynth(name, map(v));
-  reg.define('syn.wave', { label: 'WAVE', min: 0, max: 3, def: 0, step: 1, options: ['SAW', 'SQUARE', 'TRI', 'SINE'], apply: syn('wave') });
-  reg.define('syn.oct', { label: 'OCTAVE', min: -2, max: 2, def: 0, step: 1, format: (v) => (v > 0 ? '+' : '') + v + ' oct', apply: syn('octave') });
-  reg.define('syn.cut', { label: 'CUTOFF', min: 60, max: 8000, def: 900, scale: 'log', unit: 'Hz', apply: syn('cutoff') });
-  reg.define('syn.env', { label: 'ENV MOD', def: 0.6, unit: '%', apply: syn('envAmt') });
-  reg.define('syn.reso', { label: 'RESO', max: 0.95, def: 0.45, unit: '%', apply: syn('reso') });
-  reg.define('syn.sub', { label: 'SUB', def: 0.3, unit: '%', apply: syn('sub') });
-  reg.define('syn.glide', { label: 'GLIDE', min: 0, max: 400, def: 25, format: (v) => Math.round(v) + 'ms', apply: syn('glide') });
-  reg.define('syn.gate', { label: 'GATE', min: -70, max: -20, def: -48, ...dB, apply: syn('gate', (v) => 10 ** (v / 20)) });
+  reg.define('master.comp', { label: 'GLUE', def: 0.2, unit: '%', apply: T((v) => engine.setComp(v)) });
+  reg.define('guard.on', { label: 'FB GUARD', def: 1, step: 1 });
+  reg.define('guard.sens', { label: 'SENSE', def: 0.5, unit: '%' });
+  reg.define('master.vol', { label: 'MASTER', def: 0.62, format: fmtFader, apply: T((v) => engine.master.gain.setTargetAtTime(faderGain(v), now(), 0.015)) });
+  reg.define('master.mon', { label: 'MONITOR', def: 0, step: 1, persist: false, apply: T((v) => engine.monitor.gain.setTargetAtTime(v >= 0.5 ? 1 : 0, now(), 0.01)) });
 }
 
-function fmtFader(v) {
-  const g = faderGain(v);
-  if (g <= 0) return '-∞';
-  const d = 20 * Math.log10(g);
-  return (d > 0 ? '+' : '') + d.toFixed(1);
-}
-function fmtPan(v) {
-  if (Math.abs(v) < 0.02) return 'C';
-  return (v < 0 ? 'L' : 'R') + Math.round(Math.abs(v) * 100);
+function applyPre(only) {
+  if (!on()) return;
+  const enabled = reg.get('pre.on') >= 0.5;
+  PRE_BANDS.forEach((_, i) => {
+    if (only !== undefined && only !== i) return;
+    engine.setPre(i, enabled, reg.get(`pre.${i}.f`), reg.get(`pre.${i}.g`), reg.get(`pre.${i}.q`));
+  });
+  if (only === undefined) engine.preHp.frequency.setTargetAtTime(enabled ? reg.get('pre.hp') : 10, now(), 0.02);
 }
 
 function applyEq(only) {
@@ -138,152 +140,251 @@ function applyEq(only) {
   });
 }
 
-// ───────────────────────── mixer strips ─────────────────────────
-const MAIN_KNOBS = {
-  dry: ['dry.lo', 'dry.hi'],
-  amp: ['amp.gain', 'amp.out'],
-  drv: ['drv.drive', 'drv.tone'],
-  dly: ['dly.time', 'dly.fb'],
-  rev: ['rev.size', 'rev.tone'],
-  mod: ['mod.rate', 'mod.depth'],
-  syn: ['syn.wave', 'syn.cut'],
-};
-const DETAIL_KNOBS = {
-  dry: ['dry.lo', 'dry.hi'],
-  amp: ['amp.gain', 'amp.bass', 'amp.mid', 'amp.treb', 'amp.out', 'amp.cabMix'],
-  drv: ['drv.drive', 'drv.tone', 'drv.type'],
-  dly: ['dly.time', 'dly.fb', 'dly.tone', 'dly.src'],
-  rev: ['rev.size', 'rev.pre', 'rev.tone', 'rev.src'],
-  mod: ['mod.rate', 'mod.depth', 'mod.fb', 'mod.src'],
-  syn: ['syn.wave', 'syn.oct', 'syn.cut', 'syn.env', 'syn.reso', 'syn.sub', 'syn.glide', 'syn.gate'],
-};
+// ───────────────────────── panels ─────────────────────────
 const meters = [];   // { canvas, analyser(), hold, t }
+const addMeter = (canvas, analyser) => meters.push({ canvas, analyser, hold: 0, t: 0 });
 
-function buildStrips() {
-  const host = $('#strips');
-  for (const s of STRIPS) {
-    const root = el('div', 'strip', host);
-    root.dataset.id = s.id;
-    root.style.setProperty('--accent', s.color);
-    const head = el('button', 's-head', root);
-    head.type = 'button';
-    head.innerHTML = `<span class="s-name"></span><span class="s-sub"></span>`;
-    head.querySelector('.s-name').textContent = s.name;
-    head.addEventListener('click', () => select(s.id));
-    const knobs = el('div', 's-knobs', root);
-    for (const id of MAIN_KNOBS[s.id]) knob(knobs, reg, id, { size: 'md', color: s.color });
-    const mid = el('div', 's-mid', root);
-    knob(mid, reg, `${s.id}.pan`, { size: 'sm', color: s.color });
-    const ms = el('div', 's-ms', mid);
-    toggle(ms, reg, `${s.id}.mute`, { text: 'M', cls: 'mute', title: 'Mute' });
-    toggle(ms, reg, `${s.id}.solo`, { text: 'S', cls: 'solo', title: 'Solo' });
-    const fw = el('div', 's-fader', root);
-    const f = fader(fw, reg, `${s.id}.lvl`, { color: s.color });
-    meters.push({ canvas: f.canvas, analyser: () => engine.strips[s.id]?.post, hold: 0, t: 0 });
-    el('div', 's-auto', root).dataset.auto = s.id;
-  }
-}
-
-function select(id) {
-  selected = id;
-  document.querySelectorAll('.strip').forEach((n) => n.classList.toggle('sel', n.dataset.id === id));
-  buildDetail();
-  if (scopeSource !== 'in' && scopeSource !== 'out') setScopeSource(id);
-}
-
-function stripSub() {
-  const subs = {
-    amp: engine.nam.loaded ? engine.nam.name : 'built-in amp',
-    rev: engine.revIR.name,
-    dly: `from ${reg.param('dly.src').format()}`,
-    mod: `from ${reg.param('mod.src').format()}`,
-    syn: 'pitch tracking',
-    drv: reg.param('drv.type').format(),
-    dry: 'clean input',
-  };
-  document.querySelectorAll('.strip').forEach((n) => {
-    n.querySelector('.s-sub').textContent = subs[n.dataset.id] ?? '';
-  });
-}
-
-// ───────────────────────── detail panel ─────────────────────────
-function buildDetail() {
-  const host = $('#detail');
-  host.innerHTML = '';
-  const s = strip[selected];
-  host.style.setProperty('--accent', s.color);
+function head(host, title, hint) {
   const h = el('div', 'panel-head', host);
-  el('h2', '', h).textContent = s.name;
-  el('span', 'hint', h).textContent = 'tap a strip name to edit it here';
-  const grid = el('div', 'd-knobs', host);
-  for (const id of DETAIL_KNOBS[selected]) knob(grid, reg, id, { size: 'md', color: s.color });
+  el('h2', '', h).textContent = title;
+  if (hint) el('span', 'hint', h).textContent = hint;
+  return h;
+}
 
-  if (selected === 'amp') {
-    const t = el('div', 'd-row', host);
-    toggle(t, reg, 'amp.cab', { text: 'CAB IR' });
-    toggle(t, reg, 'amp.norm', { text: 'NORMALIZE', title: 'Match loudness of NAM models' });
-    loaderBlock(host, 'NAM AMP MODEL', engine.nam.loaded ? engine.nam.name : 'Built-in amp (no model loaded)', '.nam', 'nam');
-    loaderBlock(host, 'CAB IMPULSE RESPONSE', engine.cab.name, '.wav,.aif,.aiff,.flac,.mp3', 'cab');
-    const tb = el('div', 'd-row', host);
-    button(tb, '◎ TONE3000', () => openT3k(), 'accent');
-    if (engine.nam.loaded) button(tb, 'Unload model', async () => { await engine.unloadNam(); stripSub(); buildDetail(); });
-  } else if (selected === 'rev') {
-    loaderBlock(host, 'REVERB IMPULSE RESPONSE', engine.revIR.name, '.wav,.aif,.aiff,.flac,.mp3', 'rev');
-    const tb = el('div', 'd-row', host);
-    button(tb, '◎ TONE3000 IR', () => openT3k(), 'accent');
-    if (engine.revIR.user) button(tb, 'Use built-in', () => { engine.resetReverbIR(); stripSub(); buildDetail(); });
-  } else if (selected === 'dly') {
-    const t = el('div', 'd-row', host);
-    let taps = [];
-    button(t, 'TAP TEMPO', () => {
-      const now = performance.now();
-      taps = taps.filter((x) => now - x < 2500);
-      taps.push(now);
-      if (taps.length >= 2) {
-        const avg = (taps[taps.length - 1] - taps[0]) / (taps.length - 1) / 1000;
-        reg.set('dly.time', avg, 'ui');
-      }
-    }, 'big');
-    for (const [label, div] of [['1/4', 1], ['1/8.', 0.75], ['1/8', 0.5], ['1/16', 0.25]]) {
-      button(t, label, () => {
-        const beat = Number($('#bpm').value) || 120;
-        reg.set('dly.time', (60 / beat) * div, 'ui');
-      });
-    }
-    const bpm = el('label', 'bpm', t);
-    bpm.innerHTML = 'BPM <input id="bpm" type="number" min="40" max="240" value="120">';
-  } else if (selected === 'syn') {
-    const p = el('div', 'd-pitch', host);
-    p.innerHTML = '<span class="note" id="synNote">—</span><span class="hz" id="synHz">play a single note</span>';
-    el('p', 'hint', host).textContent = 'Monophonic: the synth follows the pitch and loudness of your instrument or voice. Play single notes cleanly; raise GATE if it chatters.';
-  } else if (selected === 'dry') {
-    el('p', 'hint', host).textContent = 'The clean input, straight to the mix bus. Every other branch runs in parallel next to it.';
-  }
+function buildInput() {
+  const host = $('#input');
+  head(host, 'INPUT');
+  const row = el('div', 'p-row', host);
+  const col = el('div', 'p-col', row);
+  knob(col, reg, 'in.trim');
+  knob(col, reg, 'gate.thr', { size: 'sm' });
+  const m = el('canvas', 'v-meter', row);
+  addMeter(m, () => engine.inAnalyser);
+  const btns = el('div', 'p-btns', host);
+  toggle(btns, reg, 'gate.on', { text: 'NOISE GATE' });
+  el('div', 'gate-led', btns).id = 'gateLed';
+}
+
+function bandTabs(host, prefix, bands, editorRef) {
+  const tabs = el('div', 'eq-bands', host);
+  const knobsRow = el('div', 'eq-knobs', host);
+  const buttons = bands.map((_, i) => button(tabs, String(i + 1), () => editorRef().select(i), 'band'));
+  return (i) => {
+    buttons.forEach((b, k) => b.classList.toggle('on', k === i));
+    knobsRow.innerHTML = '';
+    for (const k of ['f', 'g', 'q']) knob(knobsRow, reg, `${prefix}.${i}.${k}`, { size: 'sm' });
+  };
+}
+
+function buildPreEq() {
+  const host = $('#preeq');
+  const h = head(host, 'PRE EQ');
+  toggle(h, reg, 'pre.on', { text: 'ON' });
+  button(h, 'FLAT', () => PRE_BANDS.forEach((b, i) => { reg.set(`pre.${i}.g`, 0, 'ui'); reg.set(`pre.${i}.f`, b.f, 'ui'); reg.set(`pre.${i}.q`, b.q, 'ui'); }), 'ghost small');
+  const canvas = el('canvas', 'eq-canvas small', host);
+  let ed;
+  const show = bandTabs(host, 'pre', PRE_BANDS, () => ed);
+  ed = new EqEditor(canvas, reg, { prefix: 'pre', bands: PRE_BANDS, onId: 'pre.on', onSelect: show });
+  const extra = el('div', 'eq-knobs', host);
+  knob(extra, reg, 'pre.hp', { size: 'sm' });
+  show(0);
+  return ed;
+}
+
+function buildTune() {
+  const host = $('#tune');
+  const h = head(host, 'AUTOTUNE');
+  toggle(h, reg, 'tune.on', { text: 'ON' });
+  const tuner = el('div', 'tuner', host);
+  tuner.innerHTML = '<div class="t-note" id="tNote">—</div><div class="t-scale"><i id="tNeedle"></i><b></b></div><div class="t-info" id="tInfo">well-tempered pitch correction</div>';
+  const grid = el('div', 'k-grid', host);
+  for (const id of ['tune.key', 'tune.scale', 'tune.temper', 'tune.ref', 'tune.amount', 'tune.speed', 'tune.mix']) knob(grid, reg, id, { size: 'sm' });
+}
+
+function buildAmp() {
+  const host = $('#amp');
+  host.innerHTML = '';
+  const h = head(host, 'AMP');
+  toggle(h, reg, 'amp.on', { text: 'ON' });
+  toggle(h, reg, 'amp.boost', { text: 'BOOST' });
+  const grid = el('div', 'k-grid', host);
+  for (const id of ['amp.drive', 'amp.gain', 'amp.bass', 'amp.mid', 'amp.treb', 'amp.out']) knob(grid, reg, id, { size: 'sm' });
+  const row = el('div', 'p-btns', host);
+  toggle(row, reg, 'amp.cab', { text: 'CAB IR' });
+  toggle(row, reg, 'amp.norm', { text: 'NORMALIZE' });
+  loaderBlock(host, 'NAM MODEL', engine.nam.loaded ? engine.nam.name : 'built-in amp', '.nam', 'nam');
+  loaderBlock(host, 'CAB IR', engine.cab.name, '.wav,.aif,.aiff,.flac,.mp3', 'cab');
+  const tb = el('div', 'p-btns', host);
+  button(tb, 'TONE3000', () => openT3k(), 'accent');
+  if (engine.nam.loaded) button(tb, 'UNLOAD', async () => { await engine.unloadNam(); buildAmp(); }, 'ghost');
 }
 
 function loaderBlock(host, title, current, accept, target) {
   const box = el('div', 'loader', host);
   el('div', 'l-title', box).textContent = title;
   el('div', 'l-name', box).textContent = current;
-  const row = el('div', 'd-row', box);
+  const row = el('div', 'p-btns', box);
   const input = el('input', '', row);
-  input.type = 'file';
-  input.accept = accept;
-  input.hidden = true;
+  input.type = 'file'; input.accept = accept; input.hidden = true;
   input.addEventListener('change', () => { if (input.files[0]) loadFile(input.files[0], target); input.value = ''; });
-  button(row, 'Load file…', () => input.click());
-  const starters = STARTERS[target] ?? [];
-  for (const st of starters) button(row, st.name, () => loadUrl(st.url, st.name, target), 'ghost');
+  button(row, 'LOAD', () => input.click(), 'small');
+  for (const st of STARTERS[target] ?? []) button(row, st.name, () => loadUrl(st.url, st.name, target), 'ghost small');
   box.addEventListener('dragover', (e) => { e.preventDefault(); box.classList.add('drop'); });
   box.addEventListener('dragleave', () => box.classList.remove('drop'));
-  box.addEventListener('drop', (e) => {
-    e.preventDefault();
-    box.classList.remove('drop');
-    const f = e.dataTransfer.files[0];
-    if (f) loadFile(f, target);
+  box.addEventListener('drop', (e) => { e.preventDefault(); box.classList.remove('drop'); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0], target); });
+}
+
+const WET_KNOBS = { dly: ['dly.time', 'dly.fb', 'dly.tone', 'dly.spread'], rev: ['rev.size', 'rev.pre', 'rev.tone'], cho: ['cho.rate', 'cho.depth', 'cho.tone'], dbl: ['dbl.time'] };
+
+function wetStrip(host, w) {
+  const s = el('div', 'strip', host);
+  s.dataset.id = w.id;
+  const hd = el('div', 's-head', s);
+  el('span', 's-name', hd).textContent = w.name;
+  el('span', 's-sub', hd).textContent = `WET · ${w.side}`;
+  const k = el('div', 's-knobs', s);
+  for (const id of WET_KNOBS[w.id]) knob(k, reg, id, { size: 'sm' });
+  if (w.id === 'rev') {
+    const b = el('div', 'p-btns', s);
+    const input = el('input', '', b);
+    input.type = 'file'; input.accept = 'audio/*,.wav'; input.hidden = true;
+    input.addEventListener('change', () => { if (input.files[0]) loadFile(input.files[0], 'rev'); input.value = ''; });
+    button(b, 'IR', () => input.click(), 'small');
+    button(b, 'PLATE', () => loadUrl(STARTERS.rev[0].url, STARTERS.rev[0].name, 'rev'), 'ghost small');
+  }
+  if (w.id === 'dly') {
+    let taps = [];
+    button(el('div', 'p-btns', s), 'TAP', () => {
+      const t = performance.now();
+      taps = taps.filter((x) => t - x < 2500);
+      taps.push(t);
+      if (taps.length >= 2) reg.set('dly.time', (taps[taps.length - 1] - taps[0]) / (taps.length - 1) / 1000, 'ui');
+    }, 'small');
+  }
+  const bottom = el('div', 's-bottom', s);
+  const f = fader(bottom, reg, `${w.id}.send`);
+  addMeter(f.canvas, () => engine.wet[w.id]?.meter);
+  toggle(s, reg, `${w.id}.mute`, { text: 'MUTE', cls: 'mute small' });
+}
+
+function buildWdw() {
+  const host = $('#wdwGrid');
+  const left = el('div', 'wdw-side', host);
+  const center = el('div', 'wdw-center', host);
+  const right = el('div', 'wdw-side', host);
+  for (const w of WETS) wetStrip(w.side === 'L' ? left : right, w);
+
+  const dry = el('div', 'strip dry', center);
+  const hd = el('div', 's-head', dry);
+  el('span', 's-name', hd).textContent = 'DRY';
+  el('span', 's-sub', hd).textContent = 'AMP · CENTER';
+  const df = el('div', 's-bottom', dry);
+  const f = fader(df, reg, 'wdw.dry');
+  addMeter(f.canvas, () => engine.dryAnalyser);
+  knob(dry, reg, 'wdw.pos', { size: 'sm' });
+
+  const wm = el('div', 'strip wetmaster', center);
+  const wh = el('div', 's-head', wm);
+  el('span', 's-name', wh).textContent = 'WET';
+  el('span', 's-sub', wh).textContent = 'RETURN · STEREO';
+  const wf = el('div', 's-bottom', wm);
+  const f2 = fader(wf, reg, 'wdw.wet');
+  addMeter(f2.canvas, () => engine.wetAnalyser);
+  knob(wm, reg, 'wdw.width', { size: 'sm' });
+  toggle(wm, reg, 'wdw.mode', { text: 'W/D/W', title: 'Wet on the sides, dry in the centre' });
+}
+
+function buildRack() {
+  const host = $('#rack');
+  const h = head(host, 'END RACK', 'optional gig modules, last in the chain');
+  const sel = el('select', '', h);
+  sel.setAttribute('aria-label', 'Add module');
+  const o0 = el('option', '', sel); o0.value = ''; o0.textContent = '+ ADD MODULE';
+  for (const [type, def] of Object.entries(RACK_MODULES)) { const o = el('option', '', sel); o.value = type; o.textContent = def.name; }
+  sel.addEventListener('change', async () => {
+    const type = sel.value;
+    sel.value = '';
+    if (!type || !(await ensureStarted())) return;
+    engine.rack.add(type);
+    saveState();
+  });
+  el('div', 'rack-slots', host).id = 'rackSlots';
+}
+
+function renderRack() {
+  const host = $('#rackSlots');
+  host.innerHTML = '';
+  const slots = engine.rack?.slots ?? [];
+  if (!slots.length) { el('div', 'hint empty', host).textContent = 'No modules yet. Add a tremolo, auto filter, bitcrush, lo-fi radio, stutter or looper.'; return; }
+  slots.forEach((s, i) => {
+    const card = el('div', 'slot', host);
+    const hd = el('div', 'slot-head', card);
+    el('span', 's-num', hd).textContent = String(i + 1);
+    el('span', 's-name', hd).textContent = s.def.name;
+    button(hd, '◀', () => { engine.rack.move(s.id, -1); saveState(); }, 'ghost tiny');
+    button(hd, '▶', () => { engine.rack.move(s.id, 1); saveState(); }, 'ghost tiny');
+    button(hd, '✕', () => { engine.rack.remove(s.id); saveState(); }, 'ghost tiny');
+    toggle(card, reg, `${s.id}.on`, { text: 'ON', cls: 'small' });
+    const k = el('div', 's-knobs', card);
+    for (const name of Object.keys(s.def.params)) knob(k, reg, `${s.id}.${name}`, { size: 'sm' });
+    if (!s.def.noMix) knob(k, reg, `${s.id}.mix`, { size: 'sm' });
+    if (s.def.buttons) {
+      const b = el('div', 'p-btns', card);
+      for (const name of s.def.buttons) {
+        const btn = button(b, name, () => s.mod.press(name, btn, s.h), name === 'REC' || name === 'HOLD' ? 'big-ish' : 'small');
+      }
+    }
+    s.mod.build?.(card);
   });
 }
 
+function buildChaos() {
+  const host = $('#chaos');
+  const h = head(host, 'QUBIT CHAOS');
+  toggle(h, reg, 'chaos.on', { text: 'ON' });
+  const viz = el('canvas', 'chaos-viz', host);
+  viz.id = 'chaosViz';
+  const grid = el('div', 'k-grid', host);
+  for (const id of ['chaos.rate', 'chaos.entropy', 'chaos.entangle', 'chaos.depth', 'chaos.glide']) knob(grid, reg, id, { size: 'sm' });
+  el('div', 'l-title', host).textContent = 'CONTROLS';
+  const chips = el('div', 'chips', host);
+  for (const t of CHAOS_TARGETS) toggle(chips, reg, `chaos.t.${t.id}`, { text: t.label, cls: 'chip' });
+}
+
+function buildMaster() {
+  const host = $('#master');
+  head(host, 'MASTER');
+  const wrap = el('div', 'm-wrap', host);
+  const eqBox = el('div', 'm-eq', wrap);
+  const eh = el('div', 'p-btns', eqBox);
+  el('span', 'l-title', eh).textContent = 'MASTER EQ';
+  toggle(eh, reg, 'eq.on', { text: 'ON', cls: 'small' });
+  button(eh, 'FLAT', () => EQ_BANDS.forEach((b, i) => { reg.set(`eq.${i}.g`, 0, 'ui'); reg.set(`eq.${i}.f`, b.f, 'ui'); reg.set(`eq.${i}.q`, b.q, 'ui'); }), 'ghost small');
+  const canvas = el('canvas', 'eq-canvas', eqBox);
+  let ed;
+  const show = bandTabs(eqBox, 'eq', EQ_BANDS, () => ed);
+  ed = new EqEditor(canvas, reg, { prefix: 'eq', bands: EQ_BANDS, onId: 'eq.on', onSelect: show });
+  show(0);
+
+  const side = el('div', 'm-side', wrap);
+  const g = el('div', 'guard', side);
+  const gh = el('div', 'p-btns', g);
+  toggle(gh, reg, 'guard.on', { text: 'FEEDBACK GUARD' });
+  const gk = el('div', 'p-btns', g);
+  knob(gk, reg, 'guard.sens', { size: 'sm' });
+  knob(gk, reg, 'master.comp', { size: 'sm' });
+  el('div', 'g-list', g).id = 'guardList';
+  button(g, 'RESET NOTCHES', () => { engine.resetGuard(); }, 'ghost small');
+
+  const vol = el('div', 'm-vol', side);
+  const f = fader(vol, reg, 'master.vol');
+  f.root.classList.add('big');
+  addMeter(f.canvas, () => engine.outAnalyser);
+  toggle(vol, reg, 'master.mon', { text: 'MONITOR', cls: 'mon', title: 'Output to speakers/headphones. Use headphones to avoid feedback.' });
+  return ed;
+}
+
+// ───────────────────────── loading ─────────────────────────
 async function ensureStarted() {
   if (!engine.started) await startAudio();
   return engine.started;
@@ -295,29 +396,25 @@ async function loadBytes(bytes, name, target) {
     if (target === 'nam') {
       const json = new TextDecoder().decode(bytes);
       const parsed = JSON.parse(json);
-      const info = await engine.loadNam(json, name);
-      const rate = info?.expectedSampleRate > 0 ? info.expectedSampleRate : parsed.sample_rate;
-      toast(`Amp model loaded: ${name}${parsed.architecture ? ' · ' + parsed.architecture : ''}`);
-      if (rate && rate !== engine.sampleRate) toast(`Model trained at ${rate} Hz; running at ${engine.sampleRate} Hz`, 'warn');
+      await engine.loadNam(json, name);
+      toast(`Amp model: ${name}${parsed.architecture ? ' · ' + parsed.architecture : ''}`);
     } else if (target === 'cab') {
       await engine.loadCabIR(bytes, name);
       reg.set('amp.cab', 1, 'ui');
-      toast(`Cab IR loaded: ${name}`);
+      toast(`Cab IR: ${name}`);
     } else if (target === 'rev') {
       await engine.loadReverbIR(bytes, name);
-      toast(`Reverb IR loaded: ${name}`);
+      toast(`Reverb IR: ${name}`);
     }
   } catch (err) {
     toast(`Could not load ${name}: ${err.message}`, 'err');
   }
-  stripSub();
-  buildDetail();
+  buildAmp();
 }
 
 async function loadFile(file, target) {
-  const name = file.name.replace(/\.[^.]+$/, '');
-  if (target === 'nam' && !/\.nam$/i.test(file.name) && /\.(wav|aiff?|flac|mp3)$/i.test(file.name)) target = 'cab';
-  await loadBytes(await file.arrayBuffer(), name, target);
+  if (target === 'nam' && !/\.nam$/i.test(file.name)) target = 'cab';
+  await loadBytes(await file.arrayBuffer(), file.name.replace(/\.[^.]+$/, ''), target);
 }
 
 async function loadUrl(url, name, target) {
@@ -326,125 +423,13 @@ async function loadUrl(url, name, target) {
     const res = await fetch(url);
     if (!res.ok) throw new Error(res.status);
     await loadBytes(await res.arrayBuffer(), name, target);
-  } catch (err) {
-    toast(`Download failed: ${err.message}`, 'err');
-  }
+  } catch (err) { toast(`Download failed: ${err.message}`, 'err'); }
 }
 
-// ───────────────────────── master + eq + auto panels ─────────────────────────
-function buildMaster() {
-  const m = $('#master');
-  const row = el('div', 'm-row', m);
-  const inCol = el('div', 'm-col', row);
-  knob(inCol, reg, 'in.trim', { size: 'md', color: '#9aa7bd' });
-  const inMeter = el('canvas', 'm-meter', inCol);
-  meters.push({ canvas: inMeter, analyser: () => engine.inAnalyser, hold: 0, t: 0 });
-  const mid = el('div', 'm-col', row);
-  knob(mid, reg, 'master.comp', { size: 'md', color: '#2fb4ff' });
-  toggle(mid, reg, 'master.limit', { text: 'LIMIT' });
-  toggle(mid, reg, 'master.mon', { text: 'MONITOR', cls: 'mon', title: 'Turn off to silence the output (feedback panic)' });
-  const out = el('div', 'm-col m-out', row);
-  const f = fader(out, reg, 'master.vol', { color: '#e8ecf4' });
-  meters.push({ canvas: f.canvas, analyser: () => engine.outAnalyser, hold: 0, t: 0 });
-}
-
-function buildEq() {
-  const host = $('#eq');
-  const head = el('div', 'panel-head', host);
-  el('h2', '', head).textContent = 'MASTER EQ';
-  toggle(head, reg, 'eq.on', { text: 'ON' });
-  button(head, 'FLAT', () => EQ_BANDS.forEach((b, i) => { reg.set(`eq.${i}.g`, 0, 'ui'); reg.set(`eq.${i}.q`, b.q, 'ui'); reg.set(`eq.${i}.f`, b.f, 'ui'); }), 'ghost');
-  const canvas = el('canvas', 'eq-canvas', host);
-  const bandRow = el('div', 'eq-bands', host);
-  const knobsRow = el('div', 'eq-knobs', host);
-  const tabs = EQ_BANDS.map((b, i) => {
-    const t = button(bandRow, String(i + 1), () => editor.select(i), 'band');
-    t.style.setProperty('--accent', BAND_COLORS[i]);
-    t.title = b.type;
-    return t;
-  });
-  const showBand = (i) => {
-    tabs.forEach((t, k) => t.classList.toggle('on', k === i));
-    knobsRow.innerHTML = '';
-    for (const k of ['f', 'g', 'q']) knob(knobsRow, reg, `eq.${i}.${k}`, { size: 'md', color: BAND_COLORS[i] });
-  };
-  const editor = new EqEditor(canvas, reg, showBand);
-  showBand(0);
-  return editor;
-}
-
-function buildAuto() {
-  const host = $('#auto');
-  el('div', 'panel-head', host).innerHTML = '<h2>AUTO MIX</h2>';
-
-  const lvl = el('div', 'a-sec', host);
-  el('div', 'a-title', lvl).textContent = 'Auto level: keeps every branch at the same loudness';
-  const lr = el('div', 'a-row', lvl);
-  toggle(lr, reg, 'mix.autolvl', { text: 'AUTO LEVEL', cls: 'wide' });
-  knob(lr, reg, 'mix.target', { size: 'sm', color: '#1fd18b' });
-
-  const sc = el('div', 'a-sec', host);
-  el('div', 'a-title', sc).textContent = 'Scenes: store two mixes, then slide or auto-morph between them';
-  const sr = el('div', 'a-row', sc);
-  button(sr, 'STORE A', () => { scenes.store('a'); toast('Scene A stored'); saveState(); }, 'scene');
-  hslider(sr, reg, 'mix.morph', { color: '#ffd23f', left: 'A', right: 'B' });
-  button(sr, 'STORE B', () => { scenes.store('b'); toast('Scene B stored'); saveState(); }, 'scene');
-  const sr2 = el('div', 'a-row', sc);
-  toggle(sr2, reg, 'mix.autoMorph', { text: 'AUTO MORPH', cls: 'wide' });
-  knob(sr2, reg, 'mix.morphRate', { size: 'sm', color: '#ffd23f' });
-
-  const au = el('div', 'a-sec', host);
-  el('div', 'a-title', au).textContent = 'Automation: record knob and fader moves, then loop them';
-  const ar = el('div', 'a-row', au);
-  const rec = button(ar, '● REC', () => autom.setState(autom.state === 'rec' ? 'play' : 'rec'), 'rec');
-  const play = button(ar, '▶ PLAY', () => autom.setState(autom.state === 'idle' ? 'play' : 'idle'), 'play');
-  button(ar, 'CLEAR', () => { autom.clear(); toast('Automation cleared'); saveState(); }, 'ghost');
-  knob(ar, reg, 'auto.len', { size: 'sm', color: '#ff3b5c' });
-  const bar = el('div', 'a-progress', au);
-  el('div', 'a-bar', bar);
-  autom.onState = (s) => {
-    rec.classList.toggle('on', s === 'rec');
-    play.classList.toggle('on', s !== 'idle');
-    play.textContent = s === 'idle' ? '▶ PLAY' : '■ STOP';
-    if (s === 'idle') saveState();
-  };
-}
-
-// ───────────────────────── display ─────────────────────────
-const scope = new Scope($('#scope'));
-
-function setScopeSource(src) {
-  scopeSource = src;
-  document.querySelectorAll('#scopeSrc .btn').forEach((b) => b.classList.toggle('on', b.dataset.src === (src === 'in' || src === 'out' ? src : 'strip')));
-}
-
-function buildDisplay() {
-  const modes = $('#scopeMode');
-  for (const [m, label] of [['scope', 'SCOPE'], ['roll', 'ROLL'], ['spectrum', 'SPECTRUM'], ['both', 'BOTH']]) {
-    const b = button(modes, label, () => {
-      scope.mode = m;
-      modes.querySelectorAll('.btn').forEach((x) => x.classList.toggle('on', x === b));
-      try { localStorage.setItem('dsd.scopeMode', m); } catch { /* storage blocked */ }
-    }, 'seg');
-    b.dataset.mode = m;
-  }
-  let saved = 'both';
-  try { saved = localStorage.getItem('dsd.scopeMode') || 'both'; } catch { /* storage blocked */ }
-  scope.mode = saved;
-  modes.querySelector(`[data-mode="${saved}"]`)?.classList.add('on');
-  const srcs = $('#scopeSrc');
-  for (const [s, label] of [['in', 'IN'], ['out', 'OUT'], ['strip', 'STRIP']]) {
-    const b = button(srcs, label, () => setScopeSource(s === 'strip' ? selected : s), 'seg');
-    b.dataset.src = s;
-  }
-  setScopeSource('out');
-  knob($('#scopeZoom'), reg, 'scope.zoom', { size: 'sm', color: '#ff7a2f' });
-}
-
-// ───────────────────────── input / output devices ─────────────────────────
+// ───────────────────────── devices + start ─────────────────────────
 async function refreshDevices() {
   if (!navigator.mediaDevices?.enumerateDevices) return;
-  const { inputs, outputs } = await engine.listInputs();
+  const { inputs, outputs } = await engine.listDevices();
   const sel = $('#inputSel');
   const cur = sel.value;
   sel.innerHTML = '';
@@ -454,7 +439,7 @@ async function refreshDevices() {
   add('file', 'Audio file…');
   if (cur && [...sel.options].some((o) => o.value === cur)) sel.value = cur;
   const out = $('#outputSel');
-  if (engine.ctx?.setSinkId || (window.AudioContext && 'setSinkId' in AudioContext.prototype)) {
+  if (window.AudioContext && 'setSinkId' in AudioContext.prototype) {
     const oc = out.value;
     out.innerHTML = '';
     const o0 = el('option', '', out); o0.value = ''; o0.textContent = 'Default output';
@@ -468,17 +453,14 @@ async function chooseInput(value) {
   if (!(await ensureStarted())) return;
   try {
     if (value === 'demo') { engine.useDemo(); setInputLabel('Demo riff'); }
-    else if (value === 'file') { $('#fileInput').click(); return; }
+    else if (value === 'file') { $('#fileInput').click(); }
     else {
-      const label = await engine.useDevice(value);
-      setInputLabel(label);
+      setInputLabel(await engine.useDevice(value));
       try { localStorage.setItem('dsd.input', value); } catch { /* storage blocked */ }
       await refreshDevices();
-      $('#inputSel').value = value || $('#inputSel').value;
+      $('#inputSel').value = value;
     }
-  } catch (err) {
-    toast(`Input error: ${err.message}`, 'err');
-  }
+  } catch (err) { toast(`Input error: ${err.message}`, 'err'); }
 }
 
 function setInputLabel(text) { $('#inputName').textContent = text; }
@@ -489,41 +471,40 @@ async function startAudio() {
     btn.disabled = true;
     btn.textContent = 'STARTING…';
     await engine.start();
+    engine.rack.onChange = () => { renderRack(); saveState(); };
+    if (pendingRack) { for (const s of pendingRack) engine.rack.add(s.type, s); pendingRack = null; }
+    renderRack();
     document.body.classList.add('live');
-    btn.textContent = '● LIVE';
+    btn.textContent = 'LIVE';
     btn.classList.add('live');
     $('#latency').textContent = `${engine.sampleRate / 1000} kHz · ${engine.latencyMs().toFixed(1)} ms`;
     let saved = null;
     try { saved = localStorage.getItem('dsd.input'); } catch { /* storage blocked */ }
     try {
-      const label = await engine.useDevice(saved && saved !== 'demo' ? saved : undefined);
-      setInputLabel(label);
+      setInputLabel(await engine.useDevice(saved && saved !== 'demo' ? saved : undefined));
       await refreshDevices();
-      const match = [...$('#inputSel').options].find((o) => o.textContent === label);
-      if (match) $('#inputSel').value = match.value;
-      toast('Live input on. Use headphones to avoid feedback.', 'warn');
     } catch (err) {
       await refreshDevices();
       $('#inputSel').value = 'demo';
       engine.useDemo();
       setInputLabel('Demo riff');
-      toast(`No input (${err.name || err.message}). Playing the demo riff instead.`, 'warn');
+      toast(`No input (${err.name || err.message}). Playing the demo riff.`, 'warn');
     }
+    $('#monitorDialog').showModal();
   } catch (err) {
     btn.disabled = false;
-    btn.textContent = '▶ START AUDIO';
+    btn.textContent = 'START';
     toast(`Audio failed to start: ${err.message}`, 'err');
   }
 }
 
-// ───────────────────────── TONE3000 dialog ─────────────────────────
+// ───────────────────────── TONE3000 ─────────────────────────
 let t3kTone = null;
 function openT3k() {
-  const d = $('#t3kDialog');
   $('#t3kKey').value = t3k.key;
   $('#t3kRedirect').textContent = redirectUri();
   renderT3k();
-  d.showModal();
+  $('#t3kDialog').showModal();
 }
 
 function renderT3k(models) {
@@ -533,19 +514,15 @@ function renderT3k(models) {
   if (!t3kTone) return;
   el('div', 't3k-tone', list).textContent = `${t3kTone.title}${t3kTone.user ? ' — by ' + (t3kTone.user.display_name || t3kTone.user.username) : ''}`;
   if (!models) { el('div', 'hint', list).textContent = 'Loading models…'; return; }
-  if (!models.length) { el('div', 'hint', list).textContent = 'No downloadable models in this tone for that architecture.'; return; }
+  if (!models.length) { el('div', 'hint', list).textContent = 'No downloadable models for that architecture.'; return; }
   for (const m of models) {
     const row = el('div', 't3k-row', list);
     el('span', '', row).textContent = `${m.name}${m.size ? ' · ' + m.size : ''}${m.architecture_version ? ' · A' + m.architecture_version : ''}`;
     const isIr = t3kTone.format === 'ir' || /\.(wav|aiff?)$/i.test(m.model_url);
-    const targets = isIr ? [['→ CAB', 'cab'], ['→ REVERB', 'rev']] : [['→ AMP', 'nam']];
-    for (const [label, target] of targets) {
+    for (const [label, target] of isIr ? [['→ CAB', 'cab'], ['→ REVERB', 'rev']] : [['→ AMP', 'nam']]) {
       button(row, label, async () => {
-        try {
-          toast(`Downloading ${m.name}…`);
-          const bytes = await t3k.file(m.model_url);
-          await loadBytes(bytes, `${t3kTone.title} · ${m.name}`, target);
-        } catch (err) { toast(err.message, 'err'); }
+        try { toast(`Downloading ${m.name}…`); await loadBytes(await t3k.file(m.model_url), `${t3kTone.title} · ${m.name}`, target); }
+        catch (err) { toast(err.message, 'err'); }
       }, 'small');
     }
   }
@@ -554,39 +531,31 @@ function renderT3k(models) {
 async function t3kPick(kind) {
   t3k.setKey($('#t3kKey').value);
   const arch = $('#t3kArch').value;
-  const opts = kind === 'ir'
-    ? { format: 'ir' }
-    : { format: 'nam', gears: kind === 'amp' ? 'amp_amp-cab_pedal' : undefined, architecture: arch };
+  const opts = kind === 'ir' ? { format: 'ir' } : { format: 'nam', gears: kind === 'amp' ? 'amp_amp-cab_pedal' : undefined, architecture: arch };
   try {
     const { toneId } = await t3k.select(opts);
     t3kTone = await t3k.tone(toneId);
     renderT3k();
-    const models = await t3k.models(toneId, kind === 'ir' ? undefined : arch);
-    renderT3k(models);
-  } catch (err) {
-    toast(err.message, 'err');
-    renderT3k();
-  }
+    renderT3k(await t3k.models(toneId, kind === 'ir' ? undefined : arch));
+  } catch (err) { toast(err.message, 'err'); renderT3k(); }
 }
 
 // ───────────────────────── presets + persistence ─────────────────────────
 const PRESETS = {
-  'Clean + Space': { 'dry.lvl': 0.7, 'amp.lvl': 0.4, 'amp.gain': -6, 'drv.lvl': 0, 'dly.lvl': 0.55, 'rev.lvl': 0.62, 'rev.size': 3.5, 'mod.lvl': 0.45, 'syn.lvl': 0 },
-  'Crunch Rhythm': { 'dry.lvl': 0, 'amp.lvl': 0.82, 'amp.gain': 8, 'amp.mid': 3, 'drv.lvl': 0.35, 'drv.drive': 0.3, 'dly.lvl': 0.25, 'rev.lvl': 0.35, 'rev.size': 1.2, 'mod.lvl': 0, 'syn.lvl': 0 },
-  'Synth Lead': { 'dry.lvl': 0.3, 'amp.lvl': 0.35, 'drv.lvl': 0, 'dly.lvl': 0.5, 'dly.time': 0.33, 'rev.lvl': 0.5, 'mod.lvl': 0.3, 'syn.lvl': 0.8, 'syn.wave': 0, 'syn.cut': 700, 'syn.env': 0.75, 'syn.reso': 0.6 },
-  'Bass Synth': { 'dry.lvl': 0.4, 'amp.lvl': 0, 'drv.lvl': 0.25, 'drv.type': 2, 'dly.lvl': 0, 'rev.lvl': 0.2, 'mod.lvl': 0, 'syn.lvl': 0.85, 'syn.wave': 1, 'syn.oct': -1, 'syn.sub': 0.7, 'syn.cut': 400 },
-  'Ambient Wash': { 'dry.lvl': 0.35, 'amp.lvl': 0.3, 'drv.lvl': 0, 'dly.lvl': 0.65, 'dly.fb': 0.7, 'dly.time': 0.62, 'rev.lvl': 0.8, 'rev.size': 7, 'mod.lvl': 0.55, 'mod.rate': 0.2, 'syn.lvl': 0.25, 'syn.wave': 3, 'syn.oct': 1 },
+  'Clean W/D/W': { 'amp.gain': -4, 'amp.boost': 0, 'wdw.dry': 0.79, 'wdw.wet': 0.72, 'wdw.width': 1.3, 'wdw.mode': 1, 'dly.send': 0.55, 'rev.send': 0.6, 'cho.send': 0.45, 'dbl.send': 0, 'dly.time': 0.38, 'dly.fb': 0.3, 'rev.size': 2.6, 'chaos.on': 0 },
+  'Tight Rhythm': { 'amp.gain': 8, 'amp.boost': 1, 'amp.drive': 0.3, 'amp.mid': 2, 'wdw.dry': 0.82, 'wdw.wet': 0.5, 'dly.send': 0.3, 'rev.send': 0.35, 'rev.size': 1.1, 'cho.send': 0, 'dbl.send': 0.6, 'chaos.on': 0 },
+  'Ambient Wide': { 'amp.gain': -2, 'wdw.dry': 0.6, 'wdw.wet': 0.85, 'wdw.width': 1.8, 'dly.send': 0.7, 'dly.fb': 0.6, 'dly.time': 0.62, 'rev.send': 0.8, 'rev.size': 7, 'cho.send': 0.55, 'cho.rate': 0.25, 'chaos.on': 0 },
+  'Chaos Garden': { 'wdw.dry': 0.7, 'wdw.wet': 0.8, 'dly.send': 0.6, 'rev.send': 0.65, 'cho.send': 0.5, 'dbl.send': 0.4, 'chaos.on': 1, 'chaos.rate': 0.4, 'chaos.entropy': 0.5, 'chaos.depth': 0.7, 'chaos.t.time': 1, 'chaos.t.filter': 1 },
+  'Vocal Tune (Werckmeister)': { 'tune.on': 1, 'tune.temper': 1, 'tune.scale': 1, 'tune.speed': 25, 'tune.amount': 1, 'amp.on': 0, 'wdw.dry': 0.8, 'wdw.wet': 0.6, 'dly.send': 0.4, 'rev.send': 0.55, 'cho.send': 0, 'dbl.send': 0.35, 'gate.thr': -50 },
 };
 
-function persistSnapshot() { return reg.snapshot((p) => p.persist); }
+const persistSnap = () => reg.snapshot((p) => p.persist && !/^r\d+\./.test(p.id));
 
 let saveTimer = null;
 function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(STATE_KEY, JSON.stringify({ params: persistSnapshot(), scenes: scenes.toJSON(), automation: autom.toJSON() }));
-    } catch { /* storage blocked or full */ }
+    try { localStorage.setItem(STATE_KEY, JSON.stringify({ params: persistSnap(), rack: engine.rack?.save() ?? pendingRack ?? [] })); } catch { /* storage blocked */ }
   }, 400);
 }
 
@@ -595,22 +564,14 @@ function loadState() {
     const s = JSON.parse(localStorage.getItem(STATE_KEY) || 'null');
     if (!s) return;
     reg.restore(s.params, 'load');
-    scenes.fromJSON(s.scenes);
-    autom.fromJSON(s.automation);
+    pendingRack = s.rack ?? null;
   } catch { /* ignore broken state */ }
-}
-
-function applyPreset(name) {
-  const defaults = {};
-  for (const p of reg.params.values()) if (p.persist && !p.id.startsWith('eq.') && !p.id.startsWith('in.') && !p.id.startsWith('master.') && !p.id.startsWith('mix.') && !p.id.startsWith('auto.') && !p.id.startsWith('scope.')) defaults[p.id] = p.def;
-  reg.restore({ ...defaults, ...PRESETS[name] }, 'ui');
-  toast(`Preset: ${name}`);
 }
 
 function buildPresets() {
   const sel = $('#presetSel');
   const add = (v, t) => { const o = el('option', '', sel); o.value = v; o.textContent = t; };
-  add('', 'Presets…');
+  add('', 'PRESETS');
   for (const n of Object.keys(PRESETS)) add(n, n);
   add('__export', 'Export to file…');
   add('__import', 'Import from file…');
@@ -618,11 +579,15 @@ function buildPresets() {
     const v = sel.value;
     sel.value = '';
     if (v === '__export') {
-      const blob = new Blob([JSON.stringify({ app: 'DawSynthDoom', version: 1, params: persistSnapshot(), scenes: scenes.toJSON(), automation: autom.toJSON() }, null, 2)], { type: 'application/json' });
-      download(blob, 'dawsynthdoom-preset.json');
-    } else if (v === '__import') {
-      $('#presetFile').click();
-    } else if (v) applyPreset(v);
+      download(new Blob([JSON.stringify({ app: 'DawSynthDoom', version: 2, params: persistSnap(), rack: engine.rack?.save() ?? [] }, null, 2)], { type: 'application/json' }), 'dawsynthdoom-preset.json');
+    } else if (v === '__import') $('#presetFile').click();
+    else if (v) {
+      const keep = /^(in\.|eq\.|pre\.|master\.|guard\.|gate\.)/;
+      const defaults = {};
+      for (const p of reg.params.values()) if (p.persist && !keep.test(p.id) && !/^r\d+\./.test(p.id)) defaults[p.id] = p.def;
+      reg.restore({ ...defaults, ...PRESETS[v] }, 'ui');
+      toast(`Preset: ${v}`);
+    }
   });
   $('#presetFile').addEventListener('change', async (e) => {
     const f = e.target.files[0];
@@ -631,8 +596,7 @@ function buildPresets() {
     try {
       const o = JSON.parse(await f.text());
       reg.restore(o.params, 'ui');
-      scenes.fromJSON(o.scenes);
-      autom.fromJSON(o.automation);
+      if (o.rack && engine.rack) { engine.rack.clear(); for (const s of o.rack) engine.rack.add(s.type, s); }
       toast(`Preset imported: ${f.name}`);
     } catch (err) { toast(`Bad preset file: ${err.message}`, 'err'); }
   });
@@ -646,35 +610,87 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
-// ───────────────────────── main loop ─────────────────────────
-let lastAuto = 0;
-let morphT0 = performance.now() / 1000;
+// ───────────────────────── live views ─────────────────────────
+const sdr = new SdrDisplay($('#sdrCanvas'));
+let sdrSource = 'out';
+
+function drawChaos() {
+  const c = $('#chaosViz');
+  if (!c) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, w, h);
+  const active = reg.get('chaos.on') >= 0.5;
+  // Bloch sphere of qubit A (x/z projection, y as dot size)
+  const r = Math.min(h / 2 - 12, 56), cx = r + 14, cy = h / 2;
+  g.strokeStyle = 'rgba(255,255,255,0.35)';
+  g.lineWidth = 1;
+  g.beginPath(); g.arc(cx, cy, r, 0, Math.PI * 2); g.stroke();
+  g.beginPath(); g.ellipse(cx, cy, r, r * 0.3, 0, 0, Math.PI * 2); g.stroke();
+  g.beginPath(); g.moveTo(cx, cy - r); g.lineTo(cx, cy + r); g.stroke();
+  const b = chaos.bloch;
+  const px = cx + b.x * r, py = cy - b.z * r;
+  g.strokeStyle = '#fff';
+  g.lineWidth = 2;
+  g.beginPath(); g.moveTo(cx, cy); g.lineTo(px, py); g.stroke();
+  g.fillStyle = '#fff';
+  g.beginPath(); g.arc(px, py, 4 + (b.y + 1) * 2, 0, Math.PI * 2); g.fill();
+  g.font = '600 9px ui-monospace, monospace';
+  g.fillText('|0⟩', cx - 8, cy - r - 3);
+  g.fillText('|1⟩', cx - 8, cy + r + 10);
+  // basis probabilities
+  const labels = ['00', '01', '10', '11'];
+  const bx = cx + r + 26, bw = (w - bx - 10) / 4;
+  chaos.p.forEach((p, i) => {
+    const x = bx + i * bw, bh = (h - 34) * p;
+    g.fillStyle = 'rgba(255,255,255,0.12)';
+    g.fillRect(x + 3, 10, bw - 6, h - 34);
+    g.fillStyle = chaos.lastMeasured === i && chaos.flash > 0 ? '#fff' : 'rgba(255,255,255,0.8)';
+    g.fillRect(x + 3, 10 + (h - 34) - bh, bw - 6, bh);
+    g.fillStyle = '#fff';
+    g.fillText(`|${labels[i]}⟩`, x + bw / 2 - 12, h - 10);
+  });
+  if (chaos.flash > 0 && active) {
+    g.globalAlpha = chaos.flash;
+    g.fillStyle = '#fff';
+    g.font = '14px "Permanent Marker", system-ui';
+    g.fillText(`MEASURED |${labels[chaos.lastMeasured]}⟩`, bx, 24);
+    g.globalAlpha = 1;
+  }
+  if (!active) { g.fillStyle = 'rgba(0,0,0,0.55)'; g.fillRect(0, 0, w, h); }
+}
+
+let lastT = performance.now(), lastGuard = 0;
 const meterBuf = new Float32Array(1024);
+let preEd, masterEd;
 
 function frame() {
   requestAnimationFrame(frame);
-  const now = performance.now();
+  const t = performance.now();
+  const dt = (t - lastT) / 1000;
+  lastT = t;
 
-  const prog = autom.tick();
-  const bar = document.querySelector('.a-bar');
-  if (bar) bar.style.width = (autom.state === 'idle' ? 0 : prog * 100) + '%';
+  const chaosOn = reg.get('chaos.on') >= 0.5;
+  if (chaosOn) {
+    const out = chaos.step(dt, { rate: reg.get('chaos.rate'), entropy: reg.get('chaos.entropy'), entangle: reg.get('chaos.entangle'), glide: reg.get('chaos.glide') });
+    engine.applyChaos(out, reg.get('chaos.depth'));
+  } else if (engine.chaos) engine.applyChaos(null, 0);
+  drawChaos();
 
-  if (reg.get('mix.autoMorph') >= 0.5) {
-    const period = reg.get('mix.morphRate');
-    const t = now / 1000 - morphT0;
-    if (!reg.touched.has('mix.morph')) reg.set('mix.morph', 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / period), 'auto');
-  } else {
-    morphT0 = now / 1000 - Math.acos(1 - 2 * reg.get('mix.morph')) / (2 * Math.PI) * reg.get('mix.morphRate');
-  }
-
-  if (now - lastAuto > 60) {
-    lastAuto = now;
-    engine.autoLevelTick(reg.get('mix.autolvl') >= 0.5, reg.get('mix.target'));
-    document.querySelectorAll('.s-auto').forEach((n) => {
-      const s = engine.strips[n.dataset.auto];
-      const auto = reg.get('mix.autolvl') >= 0.5 && s;
-      n.textContent = auto ? `auto ${(20 * Math.log10(s.autoGain)).toFixed(1)} dB` : '';
-    });
+  if (engine.started && t - lastGuard > 100) {
+    lastGuard = t;
+    engine.guardTick(reg.get('guard.on') >= 0.5, reg.get('guard.sens'));
+    const list = $('#guardList');
+    const ns = engine.guard.notches;
+    list.textContent = reg.get('guard.on') < 0.5 ? 'off' : ns.length
+      ? ns.map((n) => `${n.freq < 1000 ? Math.round(n.freq) : (n.freq / 1000).toFixed(2) + 'k'} ${Math.round(n.gain)}dB`).join(' · ')
+      : 'listening · no feedback';
+    list.classList.toggle('alert', engine.guard.duck === 1);
+    sdr.notches = ns;
   }
 
   for (const m of meters) {
@@ -686,55 +702,55 @@ function frame() {
       for (let i = 0; i < meterBuf.length; i++) { const v = Math.abs(meterBuf[i]); if (v > peak) peak = v; sum += v * v; }
       rms = Math.sqrt(sum / meterBuf.length);
     }
-    if (peak >= m.hold || now - m.t > 1200) { m.hold = Math.max(peak, m.hold * 0.9); if (peak >= m.hold) m.t = now; }
+    if (peak >= m.hold || t - m.t > 1200) { m.hold = Math.max(peak, m.hold * 0.9); if (peak >= m.hold) m.t = t; }
     drawMeter(m.canvas, peak, rms, m.hold);
   }
 
   if (engine.started) {
-    let src = engine.outAnalyser, ref = engine.inAnalyser, color = '#ff7a2f', label = 'OUTPUT';
-    if (scopeSource === 'in') { src = engine.inAnalyser; ref = null; color = '#9aa7bd'; label = 'INPUT'; }
-    else if (scopeSource !== 'out') { src = engine.strips[scopeSource].post; color = strip[scopeSource].color; label = strip[scopeSource].name; }
-    scope.color = color;
-    scope.label = label + (ref ? '  vs  INPUT' : '');
-    scope.draw(src, ref, engine.sampleRate);
-    eqEditor.draw(engine.mixAnalyser);
+    const src = sdrSource === 'in' ? engine.inAnalyser : engine.outAnalyser;
+    sdr.label = sdrSource === 'in' ? 'INPUT' : 'OUTPUT';
+    sdr.draw(src);
+    preEd.draw(engine.preAnalyser);
+    masterEd.draw(engine.mixAnalyser);
   } else {
-    scope.draw(null);
-    eqEditor.draw(null);
+    sdr.draw(null);
+    preEd.draw(null);
+    masterEd.draw(null);
   }
 }
 
 // ───────────────────────── boot ─────────────────────────
 defineParams();
-buildDisplay();
-buildMaster();
-buildStrips();
-const eqEditor = buildEq();
-buildAuto();
+buildInput();
+preEd = buildPreEq();
+buildTune();
+buildAmp();
+buildWdw();
+buildRack();
+buildChaos();
+masterEd = buildMaster();
 buildPresets();
 loadState();
-select('amp');
-stripSub();
+renderRack();
 
 engine.onStatus = (kind, text) => {
   if (kind.endsWith('error')) toast(text, 'err');
-  stripSub();
-  if (selected === 'amp') buildDetail();
+  else if (kind === 'guard') toast(text, 'warn');
+  if (kind.startsWith('nam')) buildAmp();
 };
-let lastPitch = 0;
-engine.onPitch = (d) => {
-  scope.info = reg.get('syn.lvl') > 0 && d.freq ? `♪ ${noteName(d.freq)}  ${d.freq.toFixed(1)} Hz` : '';
-  if (selected !== 'syn') return;
-  const n = $('#synNote'), hz = $('#synHz');
-  if (!n) return;
-  if (d.freq) { n.textContent = noteName(d.freq); hz.textContent = `${d.freq.toFixed(1)} Hz`; lastPitch = performance.now(); }
-  else if (performance.now() - lastPitch > 600) { n.textContent = '—'; hz.textContent = 'play a single note'; }
+engine.onFront = (d) => {
+  const led = $('#gateLed');
+  if (led) led.classList.toggle('open', d.gate > 0.5);
+  if (reg.get('tune.on') < 0.5) { $('#tNote').textContent = '—'; $('#tInfo').textContent = 'well-tempered pitch correction'; sdr.info = ''; return; }
+  if (d.f0) {
+    $('#tNote').textContent = d.target;
+    const err = Math.max(-50, Math.min(50, d.err));
+    $('#tNeedle').style.left = `${50 + err}%`;
+    $('#tInfo').textContent = `${d.f0.toFixed(1)} Hz · ${err > 0 ? '+' : ''}${err.toFixed(0)}¢ · ${reg.param('tune.temper').format()} ${d.tcents >= 0 ? '+' : ''}${d.tcents.toFixed(1)}¢`;
+    sdr.info = `TUNE ${d.target} ${err > 0 ? '+' : ''}${err.toFixed(0)}¢ → ${reg.param('tune.temper').format()}`;
+  }
 };
-
-reg.onChange((id) => {
-  saveState();
-  if (id === 'drv.type' || id.endsWith('.src')) stripSub();
-});
+reg.onChange(() => saveState());
 
 $('#startBtn').addEventListener('click', () => { if (!engine.started) startAudio(); });
 $('#inputSel').addEventListener('change', (e) => chooseInput(e.target.value));
@@ -753,8 +769,18 @@ for (let i = 0; i < 3; i++) {
   reg.param('in.ch').widgets.add({ update: (v) => b.classList.toggle('on', v === i) });
   b.classList.toggle('on', reg.get('in.ch') === i);
 }
+for (const [src, label] of [['in', 'IN'], ['out', 'OUT']]) {
+  const b = button($('#sdrSrc'), label, () => {
+    sdrSource = src;
+    document.querySelectorAll('#sdrSrc .btn').forEach((x) => x.classList.toggle('on', x === b));
+  }, 'seg');
+  b.classList.toggle('on', src === sdrSource);
+}
 navigator.mediaDevices?.addEventListener?.('devicechange', () => refreshDevices());
 refreshDevices();
+
+$('#monYes').addEventListener('click', () => { reg.set('master.mon', 1, 'ui'); $('#monitorDialog').close(); });
+$('#monNo').addEventListener('click', () => { $('#monitorDialog').close(); toast('Monitor is off. Turn it on in MASTER when you have headphones.', 'warn'); });
 
 let recording = false;
 $('#recBtn').addEventListener('click', async () => {
@@ -764,11 +790,11 @@ $('#recBtn').addEventListener('click', async () => {
     try { engine.startRecording(); } catch (err) { toast(`Recording unsupported: ${err.message}`, 'err'); return; }
     recording = true;
     b.classList.add('on');
-    b.textContent = '■ STOP REC';
+    b.textContent = 'STOP REC';
   } else {
     recording = false;
     b.classList.remove('on');
-    b.textContent = '● REC';
+    b.textContent = 'REC';
     const blob = await engine.stopRecording();
     if (blob) {
       const ext = blob.type.includes('mp4') ? 'm4a' : blob.type.includes('ogg') ? 'ogg' : 'webm';
@@ -789,7 +815,6 @@ $('#t3kDisconnect').addEventListener('click', () => { t3k.disconnect(); t3kTone 
 $('#helpBtn').addEventListener('click', () => $('#helpDialog').showModal());
 $('#helpClose').addEventListener('click', () => $('#helpDialog').close());
 
-// Drop a .nam or IR anywhere on the page.
 document.addEventListener('dragover', (e) => e.preventDefault());
 document.addEventListener('drop', (e) => {
   if (e.defaultPrevented) return;
@@ -797,13 +822,19 @@ document.addEventListener('drop', (e) => {
   const f = e.dataTransfer?.files?.[0];
   if (!f) return;
   if (/\.nam$/i.test(f.name)) loadFile(f, 'nam');
-  else if (/\.(wav|aiff?|flac|mp3)$/i.test(f.name)) loadFile(f, selected === 'rev' ? 'rev' : 'cab');
-  else if (/\.json$/i.test(f.name)) { const dt = new DataTransfer(); dt.items.add(f); $('#presetFile').files = dt.files; $('#presetFile').dispatchEvent(new Event('change')); }
+  else if (/\.(wav|aiff?|flac|mp3)$/i.test(f.name)) loadFile(f, 'cab');
 });
 
 document.addEventListener('keydown', (e) => {
   if (e.target.closest('input, select, textarea, [role="slider"]')) return;
-  if (e.code === 'Space') { e.preventDefault(); if (!engine.started) startAudio(); else reg.set('master.mon', reg.get('master.mon') >= 0.5 ? 0 : 1, 'ui'); }
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (!engine.started) startAudio();
+    else reg.set('master.mon', reg.get('master.mon') >= 0.5 ? 0 : 1, 'ui');
+  }
 });
 
 requestAnimationFrame(frame);
+
+// console handle for debugging
+window.dsd = { engine, reg };

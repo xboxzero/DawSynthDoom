@@ -203,23 +203,21 @@ export function drawMeter(canvas, peak, rms, hold) {
     const n = Math.min(1, Math.max(0, (db + 60) / 66));
     return h - n * h;
   };
-  g.fillStyle = 'rgba(255,255,255,0.06)';
+  g.fillStyle = 'rgba(255,255,255,0.08)';
   g.fillRect(0, 0, w, h);
   const yP = toY(peak), yR = toY(rms);
-  const grad = g.createLinearGradient(0, h, 0, 0);
-  grad.addColorStop(0, '#1fd18b');
-  grad.addColorStop(0.72, '#c8e34a');
-  grad.addColorStop(0.88, '#ffb020');
-  grad.addColorStop(1, '#ff3b5c');
-  g.fillStyle = grad;
-  g.globalAlpha = 0.45;
+  g.fillStyle = '#fff';
+  g.globalAlpha = 0.35;
   g.fillRect(0, yP, w, h - yP);
   g.globalAlpha = 1;
   g.fillRect(0, yR, w, h - yR);
+  // 0 dBFS line
+  g.fillStyle = 'rgba(255,255,255,0.4)';
+  g.fillRect(0, toY(1), w, 1);
   if (hold > 0) {
     const yH = toY(hold);
-    g.fillStyle = hold >= 0.999 ? '#ff3b5c' : '#e8ecf4';
-    g.fillRect(0, yH, w, 2);
+    g.fillStyle = '#fff';
+    g.fillRect(0, yH, w, hold >= 0.999 ? 5 : 2);
   }
 }
 

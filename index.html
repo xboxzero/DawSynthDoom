@@ -3,64 +3,83 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#0b0e15">
+<meta name="theme-color" content="#000000">
 <title>DawSynthDoom</title>
-<meta name="description" content="Live DAW effect mixer and synthesizer in the browser: capture your audio interface, run NAM amp models, IR cabs, parallel effects, EQ and auto mixing.">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b0e15'/%3E%3Cpath d='M8 34 Q16 10 24 34 T40 34 T56 34' fill='none' stroke='%23ff7a2f' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E">
+<meta name="description" content="Live wet/dry/wet guitar and vocal rig in the browser: NAM amp, IR cab, pre-amp EQ, well-temperament autotune, qubit chaos modulation, feedback guard and an SDR-style spectrum display.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23000'/%3E%3Cpath d='M8 34 Q16 10 24 34 T40 34 T56 34' fill='none' stroke='%23fff' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Permanent+Marker&family=Sedgwick+Ave+Display&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-<header class="top">
-  <div class="brand"><span class="logo">◢◤</span> DAW<b>SYNTH</b>DOOM</div>
-  <button id="startBtn" class="btn start" type="button">▶ START AUDIO</button>
-  <div class="io">
-    <label class="field"><span>INPUT</span><select id="inputSel" aria-label="Input device"><option value="">Press start to list devices</option></select></label>
-    <div class="seg-group" id="chSel" aria-label="Input channel"></div>
-    <label class="field" hidden><span>OUTPUT</span><select id="outputSel" aria-label="Output device"></select></label>
+<aside id="sdr" aria-label="Spectrum and waterfall">
+  <div class="sdr-head">
+    <span class="tag">SIGNAL</span>
+    <div class="seg-group" id="sdrSrc"></div>
   </div>
-  <div class="status"><span id="inputName">no input</span><span id="latency"></span></div>
-  <div class="actions">
-    <select id="presetSel" aria-label="Presets"></select>
-    <button id="t3kBtn" class="btn accent" type="button">◎ TONE3000</button>
-    <button id="recBtn" class="btn rec" type="button">● REC</button>
-    <a class="btn" href="modular.html">⊞ PATCH</a>
-    <button id="helpBtn" class="btn ghost" type="button" aria-label="Help">?</button>
-  </div>
-  <input id="fileInput" type="file" accept="audio/*" hidden>
-  <input id="presetFile" type="file" accept=".json,application/json" hidden>
-</header>
+  <canvas id="sdrCanvas"></canvas>
+</aside>
 
-<main>
-  <section class="row1">
-    <div class="panel display">
-      <div class="d-bar">
-        <div class="seg-group" id="scopeMode"></div>
-        <div class="seg-group" id="scopeSrc"></div>
-        <div id="scopeZoom"></div>
-      </div>
-      <canvas id="scope" aria-label="Live waveform display"></canvas>
+<div class="app">
+  <header class="top">
+    <div class="brand">DawSynthDoom</div>
+    <button id="startBtn" class="btn start" type="button">START</button>
+    <div class="io">
+      <label class="field"><span>INPUT</span><select id="inputSel" aria-label="Input device"><option value="">press start</option></select></label>
+      <div class="seg-group" id="chSel" aria-label="Input channel"></div>
+      <label class="field" hidden><span>OUTPUT</span><select id="outputSel" aria-label="Output device"></select></label>
     </div>
-    <div class="panel master" id="master"><div class="panel-head"><h2>MASTER</h2></div></div>
-  </section>
+    <div class="status"><span id="inputName">no input</span><span id="latency"></span></div>
+    <div class="actions">
+      <select id="presetSel" aria-label="Presets"></select>
+      <button id="t3kBtn" class="btn" type="button">TONE3000</button>
+      <button id="recBtn" class="btn rec" type="button">REC</button>
+      <button id="helpBtn" class="btn ghost" type="button" aria-label="Help">?</button>
+    </div>
+    <input id="fileInput" type="file" accept="audio/*" hidden>
+    <input id="presetFile" type="file" accept=".json,application/json" hidden>
+  </header>
 
-  <section class="panel mixer">
-    <div class="bus bus-in"><span>INPUT</span><i></i><em>splits into every branch in parallel</em></div>
-    <div class="strips" id="strips"></div>
-    <div class="bus bus-out"><span>MIX BUS</span><i></i><em>EQ ▸ GLUE ▸ MASTER ▸ LIMIT ▸ OUT</em></div>
-  </section>
+  <main>
+    <div class="flow"><span>INPUT</span><i></i><span>PRE-AMP</span><i></i><span>AMP</span><i></i><span>WET · DRY · WET</span><i></i><span>END RACK</span><i></i><span>MASTER</span></div>
 
-  <section class="row3">
-    <div class="panel detail" id="detail"></div>
-    <div class="panel eq" id="eq"></div>
-    <div class="panel auto" id="auto"></div>
-  </section>
-</main>
+    <section class="row pre">
+      <div class="panel" id="input"></div>
+      <div class="panel" id="preeq"></div>
+      <div class="panel" id="tune"></div>
+      <div class="panel" id="amp"></div>
+    </section>
+
+    <section class="panel wdw">
+      <div class="panel-head"><h2>WET · DRY · WET</h2><span class="hint">effects run in parallel on the sides, the dry amp stays in the centre</span></div>
+      <div class="wdw-grid" id="wdwGrid"></div>
+    </section>
+
+    <section class="panel" id="rack"></section>
+
+    <section class="row last">
+      <div class="panel" id="chaos"></div>
+      <div class="panel" id="master"></div>
+    </section>
+  </main>
+</div>
 
 <div id="toasts" aria-live="polite"></div>
 
+<dialog id="monitorDialog">
+  <div class="dlg-head"><h2>Monitor</h2></div>
+  <p>The output starts muted to stop feedback. Turn the monitor on only with <b>headphones</b>, or with speakers placed well away from the mic or pickup.</p>
+  <p class="hint">The feedback guard and noise gate stay on. Space toggles the monitor at any time.</p>
+  <div class="p-btns">
+    <button id="monYes" class="btn start" type="button">I'M ON HEADPHONES · MONITOR ON</button>
+    <button id="monNo" class="btn ghost" type="button">KEEP MUTED</button>
+  </div>
+</dialog>
+
 <dialog id="t3kDialog">
-  <div class="dlg-head"><h2>◎ TONE3000</h2><button id="t3kClose" class="btn ghost" type="button" aria-label="Close">✕</button></div>
-  <p class="hint">Browse thousands of free NAM amp captures and IRs on <a href="https://www.tone3000.com" target="_blank" rel="noopener">tone3000.com</a> and load them straight into the AMP, CAB or REVERB slot.</p>
+  <div class="dlg-head"><h2>TONE3000</h2><button id="t3kClose" class="btn ghost" type="button" aria-label="Close">✕</button></div>
+  <p class="hint">Load free NAM amp captures and IRs from <a href="https://www.tone3000.com" target="_blank" rel="noopener">tone3000.com</a> straight into the AMP, CAB or REVERB.</p>
   <ol class="hint steps">
     <li>On tone3000.com open <b>Settings → API Keys</b> and create a key.</li>
     <li>Add this redirect URL to the key: <code id="t3kRedirect"></code> <button id="t3kCopy" class="btn small" type="button">copy</button></li>
@@ -68,12 +87,12 @@
   </ol>
   <label class="field wide"><span>KEY</span><input id="t3kKey" type="text" placeholder="t3k_pub_…" autocomplete="off" spellcheck="false"></label>
   <label class="field"><span>NAM</span><select id="t3kArch"><option value="1">A1 (classic)</option><option value="2">A2 (new)</option></select></label>
-  <div class="d-row">
-    <button id="t3kAmp" class="btn accent" type="button">Pick amp / pedal</button>
-    <button id="t3kAll" class="btn" type="button">Pick any NAM</button>
-    <button id="t3kIr" class="btn" type="button">Pick IR</button>
+  <div class="p-btns">
+    <button id="t3kAmp" class="btn" type="button">PICK AMP / PEDAL</button>
+    <button id="t3kAll" class="btn" type="button">PICK ANY NAM</button>
+    <button id="t3kIr" class="btn" type="button">PICK IR</button>
   </div>
-  <div class="d-row"><span id="t3kStatus" class="hint"></span><button id="t3kDisconnect" class="btn ghost small" type="button">disconnect</button></div>
+  <div class="p-btns"><span id="t3kStatus" class="hint"></span><button id="t3kDisconnect" class="btn ghost small" type="button">disconnect</button></div>
   <div id="t3kModels" class="t3k-models"></div>
   <p class="hint">No key? Download a <code>.nam</code> or <code>.wav</code> from TONE3000 and drop it anywhere on this page.</p>
 </dialog>
@@ -81,15 +100,13 @@
 <dialog id="helpDialog">
   <div class="dlg-head"><h2>How it works</h2><button id="helpClose" class="btn ghost" type="button" aria-label="Close">✕</button></div>
   <ul class="hint help">
-    <li><b>Start:</b> press <b>▶ START AUDIO</b> and allow microphone access. Pick your audio interface and channel (IN 1 / IN 2 / 1+2). Use headphones.</li>
-    <li><b>Parallel mixer:</b> your input feeds every branch at once (Direct, Amp, Drive, Delay, Reverb, Mod, Synth). Each branch has its own fader, pan, mute and solo, and they all sum into the master.</li>
-    <li><b>Controls:</b> drag knobs up/down (or sideways), use the mouse wheel, or the arrow keys. <b>Double-click or double-tap</b> resets to default. Tap anywhere on a fader track to jump there.</li>
-    <li><b>NAM + IR:</b> tap the AMP strip name, then load a <code>.nam</code> model and a cab IR, or use the starter models or TONE3000.</li>
-    <li><b>Synth:</b> follows the pitch of single notes you play or sing, and turns them into a filtered synth voice.</li>
-    <li><b>EQ:</b> drag the numbered points: left/right sets frequency, up/down sets gain. Wheel or the Q knob sets width.</li>
-    <li><b>Auto mix:</b> <i>Auto level</i> balances the branches by loudness. <i>Scenes</i> store two mixes and morph between them. <i>Automation</i> records your moves and loops them.</li>
-    <li><b>Display:</b> SCOPE shows the live waveform (input in grey behind the output). ROLL scrolls it over time. SPECTRUM shows frequencies. STRIP shows the selected branch.</li>
-    <li><b>Keys:</b> Space starts audio, then toggles the monitor on and off (feedback panic).</li>
+    <li><b>Start</b>, allow audio input and pick your interface and channel. The output stays muted until you confirm headphones.</li>
+    <li><b>Feedback guard</b> watches the output. When a frequency starts to ring, it cuts it with a narrow notch, and briefly ducks the master if the ring gets loud. Notches show as dashed lines on the left display.</li>
+    <li><b>Pre-amp:</b> noise gate, then autotune, then a 4-band EQ with low cut, all before the amp. The autotune snaps to the nearest note of your key and scale in the chosen temperament. Werckmeister III, Kirnberger III, Vallotti and Young II are historical well temperaments; A stays at your reference pitch.</li>
+    <li><b>Wet · dry · wet:</b> the dry amp sits in the centre. Delay, reverb, chorus and doubler are 100% wet sends on the sides. Set DRY and WET separately; WIDTH and W/D/W control how far apart they sit.</li>
+    <li><b>End rack:</b> add tremolo, auto filter, bitcrush, lo-fi radio, stutter or looper at the end of the chain. Reorder with ◀ ▶.</li>
+    <li><b>Qubit chaos:</b> a simulated two-qubit quantum state moves the parameters you pick. ENTROPY sets how often the state is measured (it jumps); ENTANGLE links the two qubits; DEPTH sets how far it pushes.</li>
+    <li><b>Controls:</b> drag knobs up/down or sideways, or use the wheel or arrow keys. Double-tap resets. Tap a fader track to jump there.</li>
   </ul>
 </dialog>
 
