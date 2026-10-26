@@ -166,6 +166,14 @@ static void detect() {
       break;
     }
   }
+  if (found < 0) {
+    // no dip under the strict threshold (noisy, weak or rich input):
+    // take the deepest dip if it is still clearly periodic (standard YIN fallback)
+    int best = -1;
+    float bv = 0.35f;
+    for (int tau = tau_min; tau < tau_max; tau++) if (diffv[tau] < bv) { bv = diffv[tau]; best = tau; }
+    found = best;
+  }
   if (found < 1) { voiced = false; period = 0.f; return; }
   const float a = diffv[found - 1], b = diffv[found], c = diffv[found + 1];
   const float den = a + c - 2.f * b;
@@ -320,7 +328,9 @@ EXPORT(process) void process(int n) {
     float y = osc * (1.f - sub_mix * 0.45f) + sub * sub_mix + m::noise() * noise_amt;
     if (fold > 0.001f) y += (m::sinf(y * fg) - y) * fold_mix;
 
-    const float want = open_gate && (voiced || amp > 0.002f) ? m::minf(1.f, env * sens) : 0.f;
+    const float drive_in = env * sens;
+    // square-root-ish curve: quiet inputs (mic, low interface gain) still give a usable level
+    const float want = open_gate && (voiced || amp > 0.002f) ? m::minf(1.f, drive_in < 1.f ? drive_in * (2.f - drive_in) : 1.f) : 0.f;
     amp += (want - amp) * (want > amp ? atk : rel);
 
     const float fc = m::minf(cutoff * m::exp2f(env_amt * 5.f * m::minf(1.f, env * sens)), nyq);

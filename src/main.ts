@@ -16,7 +16,7 @@ const $ = <T extends HTMLElement = HTMLElement>(s: string): T => {
   return e;
 };
 
-const STATE_KEY = 'dsd.state.v3';
+const STATE_KEY = 'dsd.state.v4';
 const STARTER = 'https://raw.githubusercontent.com/tone-3000/neural-amp-modeler-wasm/refs/heads/main/ui/public/';
 const touch = isTouchDevice();
 
@@ -58,7 +58,8 @@ function defineParams(): void {
   D({ id: 'safe.on', label: 'PHONE SAFE', def: touch ? 1 : 0, step: 1, apply: live((v) => { engine.setSafe(v >= 0.5); void reopenInput(); }) });
   D({ id: 'sys.low', label: 'LOWEST LATENCY', def: 1, step: 1 });
   D({ id: 'bass.gate', label: 'GATE', min: -80, max: -20, def: -54, unit: 'dB', apply: live((v) => engine.setBass('gateThresh', 10 ** (v / 20))) });
-  D({ id: 'bass.sens', label: 'SENS', min: 0.5, max: 20, def: 4, scale: 'log', apply: bass('sens') });
+  D({ id: 'bass.sens', label: 'SENS', min: 0.5, max: 20, def: 6, scale: 'log', apply: bass('sens') });
+  D({ id: 'in.auto', label: 'AUTO CHANNEL', def: 1, step: 1 });
 
   D({ id: 'tune.key', label: 'KEY', min: 0, max: 11, def: 0, step: 1, options: NOTE_NAMES, apply: bass('key') });
   D({ id: 'tune.scale', label: 'SCALE', min: 0, max: SCALES.length - 1, def: 2, step: 1, options: SCALES.map((s) => s.name), apply: bass('scale') });
@@ -80,7 +81,8 @@ function defineParams(): void {
   D({ id: 'bass.attack', label: 'ATTACK', min: 0.5, max: 200, def: 3, scale: 'log', unit: 'ms', apply: bass('attack') });
   D({ id: 'bass.release', label: 'RELEASE', min: 5, max: 2000, def: 120, scale: 'log', unit: 'ms', apply: bass('release') });
   D({ id: 'bass.level', label: 'LEVEL', max: 1.5, def: 0.8, unit: '%', apply: bass('level') });
-  D({ id: 'bass.blend', label: 'SYNTH IN', def: 0, unit: '%', apply: bass('blend') });
+  // DIRECT: your input itself, always audible even when the bass voice can't find a pitch
+  D({ id: 'bass.blend', label: 'DIRECT', def: 0.35, unit: '%', apply: bass('blend') });
 
   const amp = live(() => engine.applyAmpRouting());
   D({ id: 'amp.on', label: 'NAM AMP', def: 0, step: 1, apply: amp });
@@ -229,9 +231,19 @@ function buildInput(): void {
   const h = head(host, 'INPUT');
   toggle(h, reg, 'safe.on', { text: 'PHONE SAFE', title: 'Echo cancellation + output cap for phones without headphones' });
   const row = el('div', 'p-row', host);
-  knobs(row, ['in.trim', 'bass.gate', 'bass.sens']);
+  knobs(row, ['in.trim', 'bass.blend', 'bass.gate', 'bass.sens']);
   addMeter(el('canvas', 'v-meter', row), () => engine.inAnalyser);
   segments(host, reg, 'in.ch');
+  // one live meter per physical input: shows which channel your instrument is on
+  const cm = el('div', 'ch-meters', host);
+  cm.id = 'chMeters';
+  INPUT_CHANNELS.slice(0, 4).forEach((label, i) => {
+    const c = el('div', 'ch', cm);
+    el('i', '', c);
+    el('span', '', c).textContent = label;
+    c.addEventListener('click', () => reg.set('in.ch', i));
+  });
+  toggle(host, reg, 'in.auto', { text: 'AUTO CHANNEL', cls: 'small', title: 'Switch to the input that has signal' });
   const st = el('div', 'in-status', host);
   st.id = 'inStatus';
   st.textContent = 'Press START, then allow audio input.';
@@ -313,7 +325,7 @@ function buildTuning(): void {
 function buildVoice(): void {
   const host = $('#voice');
   head(host, 'BASS VOICE', 'follows your synth');
-  knobs(host, ['bass.shape', 'bass.sub', 'bass.fold', 'bass.noise', 'bass.cutoff', 'bass.reso', 'bass.env', 'bass.drive', 'bass.attack', 'bass.release', 'bass.level', 'bass.blend']);
+  knobs(host, ['bass.shape', 'bass.sub', 'bass.fold', 'bass.noise', 'bass.cutoff', 'bass.reso', 'bass.env', 'bass.drive', 'bass.attack', 'bass.release', 'bass.level']);
 }
 
 function buildAmp(): void {
@@ -808,11 +820,47 @@ function drawLegend(): void {
   }
 }
 
+let silentSince = 0, otherSince = 0, otherCh = -1, noSignalShown = false;
+function inputWatch(t: number): void {
+  if (!engine.started || currentInput === 'demo' || currentInput === 'file') return;
+  const lv = engine.channelLevels();
+  const meters = document.querySelectorAll<HTMLElement>('#chMeters .ch');
+  lv.forEach((db, i) => {
+    const m = meters[i];
+    if (!m) return;
+    m.querySelector('i')!.style.height = `${Math.max(0, Math.min(100, ((db + 70) / 70) * 100))}%`;
+    m.classList.toggle('sel', Math.round(reg.get('in.ch')) === i || (reg.get('in.ch') === 4 && i < 2));
+    m.classList.toggle('dead', i >= engine.inputChannels);
+  });
+  const ch = Math.round(reg.get('in.ch'));
+  const cur = ch === 4 ? Math.max(lv[0], lv[1]) : lv[ch] ?? -120;
+  const loudest = lv.reduce((b, v, i) => (v > lv[b] ? i : b), 0);
+  if (cur > -60) { silentSince = 0; noSignalShown = false; }
+  else if (!silentSince) silentSince = t;
+  // auto channel: the selected input is silent but another one has a real signal
+  if (reg.on('in.auto') && ch !== 4 && loudest !== ch && lv[loudest] > -45 && cur < -60) {
+    if (otherCh !== loudest) { otherCh = loudest; otherSince = t; }
+    else if (t - otherSince > 300) {
+      reg.set('in.ch', loudest);
+      toast(`Signal found on ${INPUT_CHANNELS[loudest]} — switched to it.`, 'warn');
+      otherCh = -1;
+    }
+  } else otherCh = -1;
+  if (silentSince && t - silentSince > 5000 && !noSignalShown && Math.max(...lv) < -60) {
+    noSignalShown = true;
+    inputStatus('No signal on any input. Check the cable, turn up the gain knob on your interface, and make sure the right device is selected above.', true);
+  } else if (!silentSince && noSignalShown === false && $('#inStatus').classList.contains('err') && /No signal/.test($('#inStatus').textContent ?? '')) {
+    inputStatus(`● ${engine.inputLabel || 'audio input'} · ${engine.inputChannels} ch`);
+  }
+}
+
 function frame(): void {
   requestAnimationFrame(frame);
   const t = performance.now(), dt = Math.min(0.1, (t - lastT) / 1000);
   lastT = t;
   runMotion(dt);
+  inputWatch(t);
+  $('#muteBanner').hidden = !engine.started || reg.on('master.mon');
   pad.draw(dt, reg.on('pad.spin'));
 
   if (engine.started && t - lastGuard > 100) {
@@ -931,6 +979,10 @@ $<HTMLSelectElement>('#outputSel').addEventListener('change', async (e) => {
 });
 navigator.mediaDevices?.addEventListener?.('devicechange', () => void refreshDevices());
 
+$('#muteBanner').addEventListener('click', () => {
+  reg.set('master.mon', 1);
+  toast('Sound on. Use headphones if you play through a microphone.', 'warn');
+});
 $('#monYes').addEventListener('click', () => { reg.set('master.mon', 1); $<HTMLDialogElement>('#monitorDialog').close(); });
 $('#monNo').addEventListener('click', () => { $<HTMLDialogElement>('#monitorDialog').close(); toast('Monitor is off. Turn it on in MASTER when you have headphones.', 'warn'); });
 

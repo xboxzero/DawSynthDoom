@@ -179,6 +179,19 @@ export class Engine {
 
   private splitter!: ChannelSplitterNode;
   private chGain: GainNode[] = [];
+  private readonly chMeters: AnalyserNode[] = [];
+  private readonly chBuf = new Float32Array(1024);
+
+  /** peak level in dBFS of each physical input channel (IN 1-4) */
+  channelLevels(): number[] {
+    return this.chMeters.map((a, i) => {
+      if (i >= this.inputChannels) return -120;
+      a.getFloatTimeDomainData(this.chBuf);
+      let pk = 0;
+      for (const v of this.chBuf) { const x = Math.abs(v); if (x > pk) pk = x; }
+      return 20 * Math.log10(pk + 1e-9);
+    });
+  }
   private preHp!: BiquadFilterNode;
   private pre: BiquadFilterNode[] = [];
   private irConv!: ConvolverNode;
@@ -224,9 +237,12 @@ export class Engine {
 
   async start(lowest: boolean): Promise<void> {
     if (this.started) return;
-    const isFirefox = /firefox/i.test(navigator.userAgent);
+    // NAM captures are trained at 48 kHz, but only Chromium resamples the input
+    // reliably; Safari/iOS and Firefox can go silent if the context rate is forced.
+    const ua = navigator.userAgent;
+    const chromium = /Chrome|Chromium|Edg\//.test(ua) && !/CriOS|FxiOS|iPhone|iPad/.test(ua);
     const opts: AudioContextOptions = { latencyHint: lowest ? 0 : 'interactive' };
-    if (!isFirefox) opts.sampleRate = 48000;   // NAM captures are trained at 48 kHz
+    if (chromium) opts.sampleRate = 48000;
     try { this.ctx = new AudioContext(opts); } catch { this.ctx = new AudioContext({ latencyHint: 'interactive' }); }
     await this.ctx.resume();
     const [wasm] = await Promise.all([
@@ -260,6 +276,11 @@ export class Engine {
       this.splitter.connect(g, i);
       g.connect(this.inMono);
       this.chGain.push(g);
+      // one meter per physical input, so we can see (and follow) where the signal is
+      const a = ctx.createAnalyser();
+      a.fftSize = 1024;
+      this.splitter.connect(a, i);
+      this.chMeters.push(a);
     }
     this.inTrim = ctx.createGain();
     this.inMono.connect(this.inTrim);

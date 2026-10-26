@@ -25,7 +25,11 @@ SYNTH IN ─ BASS VOICE (C++ → WebAssembly) ─ PRE-AMP EQ ─ NAM BASS AMP + 
 - **3D FX pad:** X, Y and Z each drive any parameter you pick, such as cutoff, fold, space or drive. Drag in the cube for X/Y; set Z with its fader, the wheel or a pinch. ORBIT plays a 3D path; QUBIT lets a simulated two-qubit quantum state steer the point.
 - **Wet · dry · wet:** the bass stays dry and mono in the centre. The effects are high-passed sends on the sides, so the low end stays tight.
 - **End rack:** phaser, tremolo, auto filter, bitcrush, stutter and a looper.
-- **Input:** the INPUT panel shows the device and channel count, or a plain explanation of what went wrong (blocked, busy, not found, needs https), with **RETRY INPUT**. A stale saved device falls back to the default input. IN 1–4 and 1+2 are supported.
+- **Input:**
+  - **DIRECT** (35% by default) keeps your own input audible even when the bass voice can't find a pitch, for example with chords, voices or noise.
+  - **Channel meters** show a live level for each interface input. **AUTO CHANNEL** switches to the input that actually has signal, because many interfaces put the instrument on IN 2.
+  - **Status:** the INPUT panel shows the device, or a plain explanation (blocked, busy, not found, no signal, needs https), with **RETRY INPUT**.
+  - **Muted output:** a header button says when the output is muted and turns sound on with one tap.
 - **3D monitor:** a perspective spectrogram. Each slice is coloured by what it hears: tonal, mains hum, or white / pink / brown / blue / violet noise, judged from spectral flatness and slope. Drag it to tilt.
 
 ## Feedback and phones
