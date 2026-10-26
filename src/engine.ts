@@ -1,25 +1,27 @@
 // Audio engine — analog synth in, well-tempered bass out.
 //
-//  INTERFACE IN ─ trim ─ BASS VOICE (worklet: track · temper · osc · fold · ladder · drive)
-//     ─ AMP (optional NAM bass amp + IR cab) ─┬─ DRY (mono, centre) ──────────────────┐
-//                                             └─ sends (high-passed, lows stay mono)   │
-//                                                DELAY · REVERB · CHORUS · DOUBLER ─ WET (stereo, width)
-//                                                                                      ▼
-//                       MIX ─ END RACK ─ FEEDBACK GUARD ─ MASTER EQ ─ GLUE ─ SAFE ─ MASTER ─ LIMITER ─ OUT
+//  INTERFACE IN ─ trim ─ BASS VOICE (C++/WASM: track · temper · osc · LFO matrix · fold · ladder · drive)
+//     ─ PRE-AMP EQ ─ AMP (optional NAM bass amp + IR cab) ─┬─ DRY (mono, centre) ─────────────────┐
+//                                                          └─ sends (high-passed, lows stay mono) │
+//                                                             DELAY · REVERB · MOD · DOUBLER ─ WET (stereo, width)
+//                                                                                                 ▼
+//          MIX ─ END RACK ─ IR SIM ─ FEEDBACK GUARD ─ MASTER EQ ─ GLUE ─ SAFE ─ MASTER ─ LIMITER ─ OUT
 
 import { NamEngine, type NamModelInfo, type NamNode } from '../vendor/nam/nam-engine.js';
 import type { Registry } from './params';
 import { Rack } from './rack';
 import type { BandDef } from './eq';
+import type { BassReport } from './dsp-params';
+export type { BassReport } from './dsp-params';
 
 export const dbToLin = (db: number): number => Math.pow(10, db / 20);
 export const faderGain = (p: number): number => (p <= 0 ? 0 : p * p * p * 2); // 0.794 ≈ unity
 
-export type WetId = 'dly' | 'rev' | 'cho' | 'dbl';
+export type WetId = 'dly' | 'rev' | 'mod' | 'dbl';
 export const WETS: readonly { id: WetId; name: string; side: 'L' | 'R' }[] = [
   { id: 'dly', name: 'DELAY', side: 'L' },
   { id: 'rev', name: 'REVERB', side: 'L' },
-  { id: 'cho', name: 'CHORUS', side: 'R' },
+  { id: 'mod', name: 'MOD', side: 'R' },
   { id: 'dbl', name: 'DOUBLER', side: 'R' },
 ];
 
@@ -31,12 +33,73 @@ export const EQ_BANDS: readonly BandDef[] = [
   { type: 'highshelf', f: 8000, q: 0.7 },
 ];
 
-export interface BassReport { f0: number; out: number; midi: number; cents: number; err: number; amp: number; gate: boolean }
+export const PRE_BANDS: readonly BandDef[] = [
+  { type: 'lowshelf', f: 80, q: 0.7 },
+  { type: 'peaking', f: 250, q: 1.0 },
+  { type: 'peaking', f: 900, q: 1.0 },
+  { type: 'highshelf', f: 3500, q: 0.7 },
+];
+
+export const MOD_TYPES = ['CHORUS', 'FLANGER', 'VIBRATO', 'PHASER', 'ROTARY', 'RING', 'AUTOPAN'] as const;
+export const IR_TYPES = ['ROOM', 'PLATE', 'HALL', 'SPRING', 'BASS CAB', 'RADIO', 'PHONE'] as const;
+export const INPUT_CHANNELS = ['IN 1', 'IN 2', 'IN 3', 'IN 4', '1+2'] as const;
+
+/** Explain a getUserMedia failure in plain words. */
+export function describeInputError(err: unknown): string {
+  const e = err as { name?: string; message?: string };
+  switch (e?.name) {
+    case 'NotAllowedError': return 'Audio input blocked. Allow the microphone / audio input for this site in the browser settings (padlock icon), then press RETRY.';
+    case 'NotFoundError': return 'No audio input found. Connect your audio interface, then press RETRY.';
+    case 'NotReadableError': return 'The input is busy. Close other apps using the interface (DAW, Zoom…), then press RETRY.';
+    case 'OverconstrainedError': return 'That device is not available any more. Pick another input.';
+    case 'SecurityError': return 'Audio input needs a secure page (https).';
+    default: return `Input error: ${e?.message ?? String(err)}`;
+  }
+}
 
 interface Wet {
   send: GainNode; mute: GainNode; ret: GainNode; meter: AnalyserNode; hp: BiquadFilterNode;
   tone?: BiquadFilterNode; l?: DelayNode; r?: DelayNode; fb?: GainNode; pre?: DelayNode; conv?: ConvolverNode;
   lfo?: OscillatorNode; gl?: GainNode; gr?: GainNode;
+}
+
+/** Built-in impulse responses for the end-of-chain IR sim, rendered offline. */
+async function makeIR(rate: number, type: number): Promise<AudioBuffer> {
+  const name = IR_TYPES[type] ?? 'ROOM';
+  const secs = { ROOM: 0.5, PLATE: 1.8, HALL: 3.2, SPRING: 1.6, 'BASS CAB': 0.05, RADIO: 0.03, PHONE: 0.03 }[name];
+  const len = Math.max(256, Math.floor(rate * secs));
+  const off = new OfflineAudioContext(2, len, rate);
+  const src = off.createBufferSource();
+  const raw = off.createBuffer(2, len, rate);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = raw.getChannelData(ch);
+    if (name === 'BASS CAB' || name === 'RADIO' || name === 'PHONE') { d[0] = 1; continue; }
+    for (let i = 0; i < len; i++) {
+      const t = i / len;
+      let v = (Math.random() * 2 - 1) * Math.pow(1 - t, name === 'PLATE' ? 1.6 : 2.4);
+      if (name === 'SPRING') v += Math.sin(2 * Math.PI * (180 + 900 * t) * (i / rate) * (1 + ch * 0.01)) * Math.exp(-t * 5) * 0.6;
+      if (name === 'ROOM' && i < rate * 0.04 && i % Math.floor(rate * (0.007 + ch * 0.002)) === 0) v += 0.7;   // early reflections
+      d[i] = v;
+    }
+  }
+  src.buffer = raw;
+  const filters: [BiquadFilterType, number, number, number][] = {
+    ROOM: [['lowpass', 7000, 0.7, 0]], PLATE: [['highpass', 200, 0.7, 0], ['highshelf', 5000, 0.7, 3]],
+    HALL: [['lowpass', 5000, 0.7, 0]], SPRING: [['highpass', 250, 0.7, 0], ['peaking', 1800, 2, 6], ['lowpass', 4500, 0.7, 0]],
+    'BASS CAB': [['highpass', 38, 0.7, 0], ['peaking', 70, 1, 3], ['peaking', 400, 1.2, -4], ['peaking', 1800, 1.5, 3], ['lowpass', 4200, 0.8, 0], ['lowpass', 5500, 0.7, 0]],
+    RADIO: [['highpass', 450, 0.9, 0], ['peaking', 1500, 1.2, 6], ['lowpass', 3200, 1.2, 0]],
+    PHONE: [['highpass', 320, 1.4, 0], ['highpass', 320, 1.4, 0], ['lowpass', 3400, 1.4, 0], ['lowpass', 3400, 1.4, 0]],
+  }[name] as [BiquadFilterType, number, number, number][];
+  let node: AudioNode = src;
+  for (const [t, f, q, g] of filters) {
+    const b = off.createBiquadFilter();
+    b.type = t; b.frequency.value = f; b.Q.value = q; b.gain.value = g;
+    node.connect(b);
+    node = b;
+  }
+  node.connect(off.destination);
+  src.start();
+  return off.startRendering();
 }
 
 const GUARD_NOTCHES = 8;
@@ -111,9 +174,22 @@ export class Engine {
   guard = { notches: [] as { idx: number; freq: number; gain: number }[], cand: new Map<number, { n: number; bin: number; peak: number; first: number }>(), duck: false };
   inputChannels = 1;
   inputLabel = '';
+  irName = 'ROOM';
+  preAnalyser!: AnalyserNode;
 
   private splitter!: ChannelSplitterNode;
-  private chGain!: [GainNode, GainNode];
+  private chGain: GainNode[] = [];
+  private preHp!: BiquadFilterNode;
+  private pre: BiquadFilterNode[] = [];
+  private irConv!: ConvolverNode;
+  private irDry!: GainNode;
+  private irWet!: GainNode;
+  private irLo!: BiquadFilterNode;
+  private irHi!: BiquadFilterNode;
+  private irUser = false;
+  private irTimer = 0;
+  private mod: { types: GainNode[]; lfo: OscillatorNode; lfoR: GainNode; depth: GainNode[]; fb: GainNode[]; ring: OscillatorNode; ringAmt: GainNode; tone: BiquadFilterNode } | null = null;
+  private wasm: ArrayBuffer | null = null;
   private inMono!: GainNode;
   private ampIn!: GainNode;
   private ampPre!: GainNode;
@@ -153,7 +229,13 @@ export class Engine {
     if (!isFirefox) opts.sampleRate = 48000;   // NAM captures are trained at 48 kHz
     try { this.ctx = new AudioContext(opts); } catch { this.ctx = new AudioContext({ latencyHint: 'interactive' }); }
     await this.ctx.resume();
-    await this.ctx.audioWorklet.addModule(new URL('./bass.worklet.js', import.meta.url));
+    const [wasm] = await Promise.all([
+      fetch(new URL('./bass.wasm', import.meta.url)).then((r) => { if (!r.ok) throw new Error(`bass.wasm ${r.status}`); return r.arrayBuffer(); }),
+      this.ctx.audioWorklet.addModule(new URL('./bass.worklet.js', import.meta.url)),
+    ]);
+    this.wasm = wasm;
+    // iOS / Safari can suspend the context (e.g. while the mic starts); resume on the next touch
+    this.ctx.addEventListener('statechange', () => this.onStatus('ctx', this.ctx.state));
     this.buildInput();
     this.buildAmp();
     this.buildMix();
@@ -169,23 +251,28 @@ export class Engine {
   // ───────────────────────── input + bass voice ─────────────────────────
   private buildInput(): void {
     const ctx = this.ctx;
-    this.splitter = ctx.createChannelSplitter(2);
-    this.chGain = [ctx.createGain(), ctx.createGain()];
+    this.splitter = ctx.createChannelSplitter(4);
     this.inMono = ctx.createGain();
     this.inMono.channelCount = 1;
     this.inMono.channelCountMode = 'explicit';
-    this.splitter.connect(this.chGain[0], 0);
-    this.splitter.connect(this.chGain[1], 1);
-    this.chGain[0].connect(this.inMono);
-    this.chGain[1].connect(this.inMono);
+    for (let i = 0; i < 4; i++) {
+      const g = ctx.createGain();
+      this.splitter.connect(g, i);
+      g.connect(this.inMono);
+      this.chGain.push(g);
+    }
     this.inTrim = ctx.createGain();
     this.inMono.connect(this.inTrim);
     this.inAnalyser = ctx.createAnalyser();
     this.inAnalyser.fftSize = 8192;
     this.inAnalyser.smoothingTimeConstant = 0.5;
     this.inTrim.connect(this.inAnalyser);
-    this.bass = new AudioWorkletNode(ctx, 'dsd-bass', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-    this.bass.port.onmessage = (e: MessageEvent<BassReport>) => this.onBass(e.data);
+    this.bass = new AudioWorkletNode(ctx, 'dsd-bass', { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], processorOptions: { wasm: this.wasm } });
+    this.bass.port.onmessage = (e: MessageEvent<BassReport | { error: string } | { ready: true }>) => {
+      const d = e.data;
+      if ('error' in d) this.onStatus('dsp-error', `Bass DSP failed: ${d.error}`);
+      else if ('f0' in d) this.onBass(d);
+    };
     this.inTrim.connect(this.bass);
     this.voiceAnalyser = ctx.createAnalyser();
     this.voiceAnalyser.fftSize = 2048;
@@ -210,21 +297,41 @@ export class Engine {
     this.stream = null;
   }
 
-  /** safe = phone-safe mode: the browser's echo cancellation removes the speaker from the mic */
+  /**
+   * Open an audio input. Tries the chosen device, then the default device, then
+   * whatever the browser allows, so a stale device id or an unsupported constraint
+   * never leaves you with no input. safe = phone-safe mode (echo cancellation).
+   */
   async useDevice(deviceId: string | undefined, safe: boolean): Promise<string> {
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      throw Object.assign(new Error('Audio input needs https (or localhost).'), { name: 'SecurityError' });
+    }
     this.stopSource();
-    const audio: MediaTrackConstraints & { latency?: number } = {
-      echoCancellation: safe, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 }, latency: 0,
-    };
-    if (deviceId) audio.deviceId = { exact: deviceId };
-    this.stream = await navigator.mediaDevices.getUserMedia({ audio });
+    const base: MediaTrackConstraints = { echoCancellation: safe, noiseSuppression: false, autoGainControl: false, channelCount: { ideal: 2 } };
+    const attempts: (MediaTrackConstraints | true)[] = [];
+    if (deviceId) attempts.push({ ...base, deviceId: { exact: deviceId } });
+    attempts.push(base, true);
+    let lastErr: unknown = null;
+    for (const audio of attempts) {
+      try {
+        this.stream = await navigator.mediaDevices.getUserMedia({ audio });
+        break;
+      } catch (err) {
+        lastErr = err;
+        const name = (err as { name?: string }).name;
+        if (name === 'NotAllowedError' || name === 'SecurityError') break;   // retrying will not help
+      }
+    }
+    if (!this.stream) throw lastErr;
     const src = this.ctx.createMediaStreamSource(this.stream);
     src.connect(this.splitter);
     this.source = src;
     const track = this.stream.getAudioTracks()[0];
     this.inputChannels = track.getSettings().channelCount ?? 1;
     this.inputLabel = track.label;
+    track.addEventListener('ended', () => this.onStatus('input-ended', 'The audio input was disconnected.'));
     this.applyChannel(this.reg.get('in.ch'));
+    if (this.ctx.state !== 'running') await this.ctx.resume();
     return track.label;
   }
 
@@ -277,18 +384,32 @@ export class Engine {
     this.demoTimer = window.setInterval(schedule, 50);
   }
 
+  /** ch: 0-3 = IN 1-4, 4 = IN 1+2. Missing channels fall back to IN 1. */
   applyChannel(ch: number): void {
-    if (!this.started && !this.chGain) return;
-    const stereo = this.inputChannels > 1;
-    sm(this.chGain[0].gain, ch === 1 && stereo ? 0 : ch === 2 && stereo ? 0.5 : 1, this.ctx);
-    sm(this.chGain[1].gain, ch === 1 && stereo ? 1 : ch === 2 && stereo ? 0.5 : 0, this.ctx);
+    if (!this.chGain.length) return;
+    const n = this.inputChannels;
+    const gains = [0, 0, 0, 0];
+    if (ch === 4) { if (n > 1) { gains[0] = 0.5; gains[1] = 0.5; } else gains[0] = 1; }
+    else gains[ch < n ? ch : 0] = 1;
+    gains.forEach((g, i) => sm(this.chGain[i].gain, g, this.ctx));
   }
 
   // ───────────────────────── amp (optional NAM bass amp + cab) ─────────────────────────
   private buildAmp(): void {
     const ctx = this.ctx;
+    // pre-amp EQ: low cut + four bands between the bass voice and the amp
+    this.preHp = ctx.createBiquadFilter();
+    this.preHp.type = 'highpass';
+    this.preHp.Q.value = 0.7;
+    this.bass.connect(this.preHp);
+    let node: AudioNode = this.preHp;
+    this.pre = PRE_BANDS.map((b) => { const f = ctx.createBiquadFilter(); f.type = b.type; f.frequency.value = b.f; f.Q.value = b.q; node.connect(f); node = f; return f; });
+    this.preAnalyser = ctx.createAnalyser();
+    this.preAnalyser.fftSize = 4096;
+    this.preAnalyser.smoothingTimeConstant = 0.8;
+    node.connect(this.preAnalyser);
     this.ampIn = ctx.createGain();
-    this.bass.connect(this.ampIn);
+    node.connect(this.ampIn);
     this.ampPre = ctx.createGain();
     this.ampIn.connect(this.ampPre);
     this.namOut = ctx.createGain();
@@ -416,17 +537,73 @@ export class Engine {
     r.pre = ctx.createDelay(0.5); r.conv = ctx.createConvolver();
     r.tone = ctx.createBiquadFilter(); r.tone.type = 'lowpass';
     r.hp.connect(r.pre); r.pre.connect(r.conv); r.conv.connect(r.tone); r.tone.connect(r.ret);
-    // chorus
-    const c = mk(220);
-    c.lfo = ctx.createOscillator(); c.lfo.start();
-    c.l = ctx.createDelay(0.1); c.r = ctx.createDelay(0.1);
-    c.l.delayTime.value = 0.012; c.r.delayTime.value = 0.016;
-    c.gl = ctx.createGain(); c.gr = ctx.createGain();
-    c.lfo.connect(c.gl); c.lfo.connect(c.gr); c.gl.connect(c.l.delayTime); c.gr.connect(c.r.delayTime);
-    c.tone = ctx.createBiquadFilter(); c.tone.type = 'lowpass';
-    const cm = ctx.createChannelMerger(2);
-    c.hp.connect(c.tone); c.tone.connect(c.l); c.tone.connect(c.r);
-    c.l.connect(cm, 0, 0); c.r.connect(cm, 0, 1); cm.connect(c.ret);
+    // MOD: seven modulation effects share one LFO; the TYPE switch picks which one you hear
+    const c = mk(140);
+    const lfo = ctx.createOscillator(); lfo.start();
+    const lfoR = ctx.createGain();                       // right-channel LFO (polarity set by SPREAD)
+    lfo.connect(lfoR);
+    const tone = ctx.createBiquadFilter(); tone.type = 'lowpass';
+    c.hp.connect(tone);
+    const types: GainNode[] = [], depth: GainNode[] = [], fbs: GainNode[] = [];
+    const typeOut = (l: AudioNode, r: AudioNode): void => {
+      const g = ctx.createGain(); g.gain.value = 0; g.channelCount = 2; g.channelCountMode = 'explicit';
+      const m2 = ctx.createChannelMerger(2);
+      l.connect(m2, 0, 0); r.connect(m2, 0, 1); m2.connect(g); g.connect(c.ret);
+      types.push(g);
+    };
+    const lfoTo = (param: AudioParam, right: boolean, scale: number): void => {
+      const g = ctx.createGain(); g.gain.value = 0; (g as GainNode & { scale?: number }).scale = scale;
+      (right ? lfoR : lfo).connect(g); g.connect(param); depth.push(g);
+    };
+    const modDelay = (baseMs: number, scaleMs: number, feedback: boolean): void => {
+      const l = ctx.createDelay(0.1), r = ctx.createDelay(0.1);
+      l.delayTime.value = baseMs / 1000; r.delayTime.value = (baseMs * 1.15) / 1000;
+      tone.connect(l); tone.connect(r);
+      lfoTo(l.delayTime, false, scaleMs / 1000); lfoTo(r.delayTime, true, scaleMs / 1000);
+      if (feedback) { for (const d of [l, r]) { const fb = ctx.createGain(); fb.gain.value = 0; d.connect(fb); fb.connect(d); fbs.push(fb); } }
+      typeOut(l, r);
+    };
+    modDelay(12, 5, false);                                  // CHORUS
+    modDelay(2, 1.8, true);                                  // FLANGER
+    modDelay(6, 3, false);                                   // VIBRATO
+    {                                                        // PHASER: four all-pass stages per side
+      const chain = (right: boolean): AudioNode => {
+        let n: AudioNode = tone;
+        for (let i = 0; i < 4; i++) {
+          const ap = ctx.createBiquadFilter(); ap.type = 'allpass'; ap.frequency.value = 700; ap.Q.value = 0.7;
+          n.connect(ap); n = ap;
+          lfoTo(ap.detune, right, 2400);
+        }
+        const mix = ctx.createGain(); tone.connect(mix); n.connect(mix); mix.gain.value = 0.7;
+        return mix;
+      };
+      typeOut(chain(false), chain(true));
+    }
+    {                                                        // ROTARY: doppler + opposed amplitude
+      const l = ctx.createDelay(0.05), r = ctx.createDelay(0.05);
+      l.delayTime.value = 0.004; r.delayTime.value = 0.004;
+      tone.connect(l); tone.connect(r);
+      lfoTo(l.delayTime, false, 0.0012); lfoTo(r.delayTime, true, -0.0012);
+      const al = ctx.createGain(), ar = ctx.createGain(); al.gain.value = 0.6; ar.gain.value = 0.6;
+      l.connect(al); r.connect(ar);
+      lfoTo(al.gain, false, 0.4); lfoTo(ar.gain, false, -0.4);
+      typeOut(al, ar);
+    }
+    const ring = ctx.createOscillator(); ring.start();
+    const ringAmt = ctx.createGain();
+    {                                                        // RING: multiply by an audio-rate carrier
+      const rm = ctx.createGain(); rm.gain.value = 0;
+      ring.connect(ringAmt); ringAmt.connect(rm.gain);
+      tone.connect(rm);
+      typeOut(rm, rm);
+    }
+    {                                                        // AUTOPAN
+      const gl = ctx.createGain(), gr = ctx.createGain(); gl.gain.value = 0.5; gr.gain.value = 0.5;
+      tone.connect(gl); tone.connect(gr);
+      lfoTo(gl.gain, false, 0.5); lfoTo(gr.gain, false, -0.5);
+      typeOut(gl, gr);
+    }
+    this.mod = { types, lfo, lfoR, depth, fb: fbs, ring, ringAmt, tone };
     // doubler
     const b = mk(180);
     b.lfo = ctx.createOscillator(); b.lfo.frequency.value = 0.13; b.lfo.start();
@@ -436,7 +613,7 @@ export class Engine {
     const bm = ctx.createChannelMerger(2);
     b.hp.connect(b.l); b.hp.connect(b.r);
     b.l.connect(bm, 0, 0); b.r.connect(bm, 0, 1); bm.connect(b.ret);
-    this.wet = { dly: d, rev: r, cho: c, dbl: b };
+    this.wet = { dly: d, rev: r, mod: c, dbl: b };
   }
 
   setWetSend(id: WetId, p: number): void { const w = this.wet[id]; if (w) sm(w.send.gain, faderGain(p), this.ctx, 0.015); }
@@ -467,14 +644,56 @@ export class Engine {
     this.revIR = { name, user: true };
   }
 
-  setChorus(): void {
-    const c = this.wet.cho;
-    if (!c?.lfo || !c.gl || !c.gr) return;
-    const depth = this.reg.get('cho.depth');
-    sm(c.lfo.frequency, this.reg.get('cho.rate'), this.ctx);
-    sm(c.gl.gain, depth * 0.005, this.ctx);
-    sm(c.gr.gain, -depth * 0.005, this.ctx);
+  setMod(): void {
+    const md = this.mod;
+    if (!md) return;
+    const type = Math.round(this.reg.get('mod.type'));
+    const depth = this.reg.get('mod.depth');
+    md.types.forEach((g, i) => sm(g.gain, i === type ? 1 : 0, this.ctx, 0.03));
+    md.lfo.type = (['sine', 'triangle', 'square', 'sawtooth'] as const)[Math.round(this.reg.get('mod.shape'))] ?? 'sine';
+    sm(md.lfo.frequency, this.reg.get('mod.rate'), this.ctx);
+    sm(md.lfoR.gain, 1 - 2 * this.reg.get('mod.spread'), this.ctx);      // 0 = in phase, 1 = opposite
+    for (const g of md.depth) sm(g.gain, depth * ((g as GainNode & { scale?: number }).scale ?? 0), this.ctx);
+    for (const g of md.fb) sm(g.gain, Math.min(0.9, this.reg.get('mod.fb')), this.ctx);
+    sm(md.ring.frequency, this.reg.get('mod.ring'), this.ctx);
+    sm(md.ringAmt.gain, depth, this.ctx);
+    sm(md.tone.frequency, this.reg.get('mod.tone'), this.ctx);
   }
+
+  setPre(i: number, on: boolean, f: number, g: number, q: number): void {
+    const b = this.pre[i];
+    if (!b) return;
+    sm(b.frequency, f, this.ctx); sm(b.gain, on ? g : 0, this.ctx); sm(b.Q, q, this.ctx);
+  }
+
+  setPreLowCut(on: boolean, hz: number): void { if (this.preHp) sm(this.preHp.frequency, on ? hz : 10, this.ctx); }
+
+  // ───────────────────────── IR sim (end of chain) ─────────────────────────
+  applyIR(): void {
+    if (!this.irConv) return;
+    const on = this.reg.on('ir.on'), mix = this.reg.get('ir.mix');
+    sm(this.irDry.gain, on ? 1 - mix : 1, this.ctx);
+    sm(this.irWet.gain, on ? mix * dbToLin(this.reg.get('ir.gain')) : 0, this.ctx);
+    sm(this.irLo.frequency, this.reg.get('ir.lo'), this.ctx);
+    sm(this.irHi.frequency, this.reg.get('ir.hi'), this.ctx);
+  }
+
+  regenIR(): void {
+    if (!this.irConv || this.irUser) return;
+    clearTimeout(this.irTimer);
+    const type = Math.round(this.reg.get('ir.type'));
+    this.irTimer = window.setTimeout(() => {
+      void makeIR(this.ctx.sampleRate, type).then((b) => { if (!this.irUser) { this.irConv.buffer = b; this.irName = IR_TYPES[type] ?? 'ROOM'; this.onStatus('ir', this.irName); } });
+    }, 80);
+  }
+
+  async loadIR(bytes: ArrayBuffer, name: string): Promise<void> {
+    this.irConv.buffer = await this.ctx.decodeAudioData(bytes);
+    this.irUser = true;
+    this.irName = name;
+  }
+
+  useBuiltInIR(): void { this.irUser = false; this.regenIR(); }
 
   setDoubler(): void {
     const b = this.wet.dbl;
@@ -497,7 +716,15 @@ export class Engine {
     const rackIn = ctx.createGain(), rackOut = ctx.createGain();
     mix.connect(rackIn);
     this.rack = new Rack(ctx, rackIn, rackOut, this.reg);
-    let node: AudioNode = rackOut;
+    // IR sim at the end of the chain
+    this.irConv = ctx.createConvolver();
+    this.irDry = ctx.createGain(); this.irWet = ctx.createGain();
+    this.irLo = ctx.createBiquadFilter(); this.irLo.type = 'highpass';
+    this.irHi = ctx.createBiquadFilter(); this.irHi.type = 'lowpass';
+    const irOut = ctx.createGain();
+    rackOut.connect(this.irDry); this.irDry.connect(irOut);
+    rackOut.connect(this.irConv); this.irConv.connect(this.irLo); this.irLo.connect(this.irHi); this.irHi.connect(this.irWet); this.irWet.connect(irOut);
+    let node: AudioNode = irOut;
     for (let i = 0; i < GUARD_NOTCHES; i++) {
       const f = ctx.createBiquadFilter();
       f.type = 'peaking'; f.frequency.value = 1000; f.Q.value = 30; f.gain.value = 0;

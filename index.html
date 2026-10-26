@@ -41,17 +41,19 @@
   </header>
 
   <main>
-    <div class="flow"><span>SYNTH IN</span><i></i><span>TRACK</span><i></i><span>TEMPER</span><i></i><span>BASS VOICE</span><i></i><span>AMP</span><i></i><span>WET·DRY·WET</span><i></i><span>RACK</span><i></i><span>MASTER</span></div>
+    <div class="flow"><span>SYNTH IN</span><i></i><span>TEMPER</span><i></i><span>BASS VOICE</span><i></i><span>PRE EQ</span><i></i><span>AMP</span><i></i><span>WET·DRY·WET</span><i></i><span>RACK</span><i></i><span>IR SIM</span><i></i><span>MASTER</span></div>
 
     <section class="row bass" data-tab="bass">
       <div class="panel" id="input"></div>
       <div class="panel" id="tuning"></div>
       <div class="panel" id="voice"></div>
+      <div class="panel" id="preeq"></div>
       <div class="panel" id="amp"></div>
     </section>
 
-    <section class="row" data-tab="pad">
+    <section class="row pads" data-tab="pad">
       <div class="panel" id="pad"></div>
+      <div class="panel" id="lfos"></div>
     </section>
 
     <section class="panel wdw" data-tab="fx">
@@ -60,6 +62,8 @@
     </section>
 
     <section class="panel" id="rack" data-tab="fx"></section>
+
+    <section class="panel" id="irsim" data-tab="fx"></section>
 
     <section class="panel" id="master" data-tab="master"></section>
   </main>
@@ -80,7 +84,8 @@
 
 <dialog id="t3kDialog">
   <div class="dlg-head"><h2>TONE3000</h2><button id="t3kClose" class="btn ghost" type="button" aria-label="Close">✕</button></div>
-  <p class="hint">Load free NAM bass amp captures and IRs from <a href="https://www.tone3000.com" target="_blank" rel="noopener">tone3000.com</a>.</p>
+  <p class="hint">Load free NAM bass amp captures and IRs from <a href="https://www.tone3000.com" target="_blank" rel="noopener">tone3000.com</a> straight into the AMP, CAB, REVERB or END IR.</p>
+  <p class="hint"><b>No key?</b> <a href="https://www.tone3000.com" target="_blank" rel="noopener">Browse tone3000.com</a>, download a <code>.nam</code> or <code>.wav</code>, and drop it on this page (or use LOAD).</p>
   <ol class="hint steps">
     <li>On tone3000.com open <b>Settings → API Keys</b> and create a key.</li>
     <li>Add this redirect URL to the key: <code id="t3kRedirect"></code> <button id="t3kCopy" class="btn small" type="button">copy</button></li>
@@ -93,9 +98,9 @@
     <button id="t3kAll" class="btn" type="button">PICK ANY NAM</button>
     <button id="t3kIr" class="btn" type="button">PICK IR</button>
   </div>
-  <div class="p-btns"><span id="t3kStatus" class="hint"></span><button id="t3kDisconnect" class="btn ghost small" type="button">disconnect</button></div>
+  <div class="p-btns"><span id="t3kStatus" class="t3k-status"></span><button id="t3kCancel" class="btn small" type="button" hidden>CANCEL</button><button id="t3kDisconnect" class="btn ghost small" type="button">disconnect</button></div>
+  <p class="hint">If TONE3000 shows an error page: check the key, and that the redirect URL above is registered on the key exactly (same capital letters).</p>
   <div id="t3kModels" class="t3k-models"></div>
-  <p class="hint">No key? Download a <code>.nam</code> or <code>.wav</code> and drop it anywhere on this page.</p>
 </dialog>
 
 <dialog id="helpDialog">
@@ -105,6 +110,10 @@
     <li><b>Well tempered:</b> each note snaps to the nearest note of your key and scale in the chosen temperament (Werckmeister III, Kirnberger III, Vallotti, Young II or equal), with A at your reference. SNAP sets how hard it pulls; BASS RANGE folds everything into E1–D#3; OCTAVE shifts it.</li>
     <li><b>Bass voice:</b> morphing saw / square / pulse oscillator with a sub, wavefolder, grit, ladder low-pass with envelope, and drive. SYNTH IN blends your original synth back in.</li>
     <li><b>3D pad:</b> X, Y and Z each control a parameter you choose. Drag in the cube for X/Y; use the Z fader, wheel or a two-finger pinch for Z. ORBIT and QUBIT move the point for you.</li>
+    <li><b>Pre-amp EQ:</b> drag the points (left/right = frequency, up/down = gain) to shape the bass before the amp. LOW CUT removes rumble.</li>
+    <li><b>Modulation:</b> two LFOs (sine, triangle, saw, square, sample &amp; hold, smooth random) can wobble cutoff, pitch, volume, fold, shape, drive, resonance or sub. SYNC locks them to the BPM. The MOD effect switches between chorus, flanger, vibrato, phaser, rotary, ring mod and autopan.</li>
+    <li><b>IR sim:</b> the last effect before the master. Pick a built-in room, plate, hall, spring, bass cab, radio or phone, or load any IR (.wav).</li>
+    <li><b>Input problems:</b> the INPUT panel shows exactly what went wrong (blocked, busy, not found). Fix it and press RETRY INPUT.</li>
     <li><b>Wet · dry · wet:</b> the bass stays dry and mono in the centre. Delay, reverb, chorus and doubler are high-passed wet sends on the sides.</li>
     <li><b>3D monitor:</b> the spectrum history in perspective, coloured by the kind of sound: tonal, hum, or white / pink / brown / blue / violet noise. Drag it to tilt.</li>
     <li><b>Feedback:</b> output starts muted; PHONE SAFE adds echo cancellation and a volume cap; the feedback guard notches any ringing frequency.</li>

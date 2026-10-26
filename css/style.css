@@ -71,7 +71,7 @@ main { padding: 14px 16px 40px; display: grid; gap: 14px; max-width: 1500px; }
 .panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
 .panel-head .hint { margin-left: auto; }
 .row { display: grid; gap: 14px; }
-.row.bass { grid-template-columns: minmax(200px, 0.8fr) minmax(0, 1fr) minmax(0, 1.4fr) minmax(0, 0.9fr); }
+.row.bass { grid-template-columns: minmax(200px, 0.8fr) minmax(0, 1fr) minmax(0, 1.4fr); }
 .flow { display: flex; align-items: center; gap: 8px; font: 400 13px var(--marker); color: var(--dim); flex-wrap: wrap; }
 .flow i { flex: 1; min-width: 12px; height: 1px; background: repeating-linear-gradient(90deg, #fff 0 6px, transparent 6px 10px); opacity: 0.35; }
 body.live .flow i { animation: flow 1s linear infinite; background-size: 20px 1px; }
@@ -166,6 +166,21 @@ body.live .flow i { animation: flow 1s linear infinite; background-size: 20px 1p
 .g-list.alert { background: #fff; color: #000; }
 .m-vol { display: flex; flex-direction: column; align-items: center; gap: 8px; }
 
+/* ───────── input status, LFOs, TONE3000 status ───────── */
+.in-status { font: 600 11px var(--mono); border: 1px solid var(--line); padding: 6px 8px; margin-top: 8px; overflow-wrap: anywhere; }
+.in-status.err { background: #fff; color: #000; border-color: #fff; }
+.row.pads { grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); }
+.lfo-card { border: 1px solid var(--line-2); padding: 8px; margin-top: 8px; background: #000; }
+.lfo-head { display: flex; align-items: center; gap: 10px; }
+.lfo-head .s-name { font-size: 20px; }
+.lfo-bar { position: relative; flex: 1; height: 10px; border: 1px solid var(--line-2); }
+.lfo-bar i { position: absolute; top: 1px; bottom: 1px; width: 6px; margin-left: -3px; background: #fff; left: 50%; }
+.lfo-card .seg-group { margin-top: 4px; }
+.t3k-status { font: 600 12px var(--mono); color: var(--dim); flex: 1; }
+.t3k-status.err { color: #000; background: #fff; padding: 4px 6px; }
+.t3k-status.wait { color: #fff; animation: blink 1.2s infinite; }
+@keyframes blink { 50% { opacity: 0.5; } }
+
 /* ───────── tabs (phones only) ───────── */
 #tabs { display: none; }
 
@@ -193,6 +208,7 @@ dialog::backdrop { background: rgba(0,0,0,0.75); }
 }
 @media (max-width: 1100px) {
   :root { --side: 300px; }
+  .row.pads { grid-template-columns: minmax(0, 1fr); }
   .wdw-grid { grid-template-columns: minmax(0, 1fr); }
   .wdw-side { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wdw-center { border: 1px dashed var(--line-2); padding: 10px; justify-content: center; }

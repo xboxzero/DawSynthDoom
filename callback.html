@@ -4,33 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TONE3000 sign-in</title>
-<style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#0b0e15;color:#e8ecf4;font:15px system-ui,sans-serif}</style>
+<style>body{margin:0;display:grid;place-items:center;min-height:100vh;background:#000;color:#fff;font:15px system-ui,sans-serif;text-align:center;padding:16px}</style>
 </head>
 <body>
 <p id="msg">Returning to DawSynthDoom…</p>
 <script>
-  // Relays the TONE3000 OAuth result back to the mixer window, then closes.
+  // Hands the TONE3000 result back to the mixer, three ways:
+  //  1. postMessage to the window that opened this popup
+  //  2. BroadcastChannel, when sign-in cut the link to the opener (the mixer acks)
+  //  3. same-tab: no mixer answered, so continue in this tab with the result in the URL
   (function () {
-    var p = new URLSearchParams(location.search);
+    var q = location.search;
+    var p = new URLSearchParams(q);
     var message = {
       type: 't3k_oauth_callback',
-      code: p.get('code'),
-      state: p.get('state'),
-      error: p.get('error'),
-      tone_id: p.get('tone_id'),
-      canceled: p.get('canceled') === 'true'
+      code: p.get('code'), state: p.get('state'), error: p.get('error'),
+      tone_id: p.get('tone_id'), canceled: p.get('canceled') === 'true'
     };
-    if (window.opener) {
-      window.opener.postMessage(message, location.origin);
-    } else if ('BroadcastChannel' in window) {
-      var bc = new BroadcastChannel('t3k_oauth');
-      bc.postMessage(message);
-      bc.close();
-    }
-    setTimeout(function () {
-      window.close();
+    var app = new URL('./', location.href).href;
+    var done = false;
+    function finish() {
+      done = true;
       document.getElementById('msg').textContent = 'Done — you can close this window.';
-    }, 150);
+      setTimeout(function () { window.close(); }, 100);
+    }
+    if (window.opener && !window.opener.closed) {
+      try { window.opener.postMessage(message, location.origin); finish(); return; } catch (e) { /* fall through */ }
+    }
+    if ('BroadcastChannel' in window) {
+      var bc = new BroadcastChannel('t3k_oauth');
+      bc.onmessage = function (e) { if (e.data && e.data.type === 't3k_ack') { bc.close(); finish(); } };
+      bc.postMessage(message);
+    }
+    setTimeout(function () { if (!done) location.replace(app + q); }, 900);
   })();
 </script>
 </body>

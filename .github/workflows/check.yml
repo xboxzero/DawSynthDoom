@@ -13,8 +13,10 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - name: C++ to WebAssembly toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
       - name: dist/ is up to date with src/
-        run: git diff --exit-code -- dist
+        run: git diff --exit-code -- dist/main.js dist/bass.worklet.js
