@@ -1,0 +1,18 @@
+{
+  "name": "dawsynthdoom",
+  "version": "3.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Live bass synthesizer rig in the browser: analog synth in, well-tempered bass out.",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && node build.mjs",
+    "serve": "python3 -m http.server 8000"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0"
+  }
+}

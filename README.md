@@ -1,53 +1,59 @@
 # DawSynthDoom
 
-A live wet / dry / wet guitar and vocal rig that runs in the browser. It needs no install and no build step, so it runs as a plain static site on GitHub Pages.
+Plug an analog synth into your audio interface and get a **well-tempered bass synthesizer** out. It's a low-latency rig that runs in the browser, with a 3D effect pad, NAM bass amps, wet / dry / wet effects, and a 3D spectrum display that colours the sound by the kind of noise it hears.
 
 **Live site:** https://xboxzero.github.io/DawSynthDoom/
 
 ## Signal chain
 
 ```
-INPUT ─ GATE ─ AUTOTUNE ─ PRE EQ ─ AMP (boost · NAM · tone · IR cab) ─┬─ DRY (centre) ───────────────┐
-                                                                      └─ DELAY / REVERB / CHORUS /   ├─ END RACK ─ FEEDBACK GUARD ─ MASTER EQ ─ GLUE ─ MASTER ─ LIMIT
-                                                                         DOUBLER (100% wet, sides) ──┘
+SYNTH IN ─ BASS VOICE (AudioWorklet) ─ NAM BASS AMP + CAB (optional) ─┬─ DRY (mono, centre) ──────┐
+            track → temper → osc/sub/fold → ladder → drive             └─ DELAY / REVERB / CHORUS / ├─ END RACK ─ FEEDBACK GUARD ─ EQ ─ GLUE ─ MASTER ─ LIMITER
+                                                                          DOUBLER (high-passed wet) ┘
 ```
 
-- **Feedback protection:**
-  - The output starts muted until you confirm you're on headphones.
-  - A noise gate and a 35 Hz rumble filter sit at the input.
-  - Delay repeats are capped at 85%.
-  - The **feedback guard** finds ringing frequencies, cuts them with narrow notches, and briefly ducks the master if a howl gets loud.
-- **Pre-amp:** noise gate, then **well-temperament autotune**, then a 4-band draggable EQ with low cut.
-  - The autotune snaps to the nearest note of your key and scale in Equal, Werckmeister III, Kirnberger III, Vallotti or Young II tuning, with A kept at your reference pitch (415–466 Hz).
-  - It has strength, retune speed and mix controls, plus a tuner readout.
-- **Amp:** a real Neural Amp Modeler engine (TONE3000's MIT-licensed WebAssembly build) that loads A1 and A2 `.nam` files. It also has a boost, a tone stack, IR cab loading, and the TONE3000 picker.
-- **Wet · dry · wet:**
-  - The dry amp signal sits in the centre.
-  - Delay (stereo ping-pong), reverb, chorus and doubler are parallel 100%-wet sends on the sides, each with its own send fader and mute.
-  - Separate DRY and WET faders, plus WIDTH and a W/D/W mode, control the stereo picture.
-- **End rack:** optional gig modules at the end of the chain: tremolo, auto filter, bitcrush, lo-fi radio, stutter (hold) and a looper (rec / overdub / stop / clear). Add, bypass, reorder or remove them while playing.
-- **Qubit chaos:** a simulated two-qubit quantum state drives the parameters you choose: the four wet sends, width, delay time, a wet filter and master swell.
-  - Its rotations and entanglement evolve continuously, and random measurements collapse the state, which makes the modulation jump.
-- **Master:** 5-band EQ, glue compressor, feedback guard, a big master volume fader, an always-on limiter, and recording to file.
-- **SDR display:** the left side shows the overall waveform, a live spectrum with peak hold, and a scrolling waterfall in the style of a software-defined-radio display, with feedback notches marked.
+- **Bass voice:** the pitch of your synth is tracked with an adaptive YIN window, about 2 periods long, updated every ~4 ms. A note only changes when two detections in a row agree, which removes octave blips. The voice follows the synth's own envelope, so its dynamics come from your playing.
+- **Well temperament:** every note snaps to the nearest note of your key and scale in Werckmeister III, Kirnberger III, Vallotti, Young II or equal temperament, with A at your reference pitch (415–466 Hz). SNAP, GLIDE, OCTAVE and BASS RANGE (which folds notes into E1–D#3) shape how it follows.
+- **Sound:** a morphing saw / square / pulse oscillator, sub oscillator, wavefolder, grit, ladder low-pass with envelope, and drive. SYNTH IN blends the original synth back in.
+- **3D FX pad:** X, Y and Z each drive any parameter you pick, such as cutoff, fold, space or drive. Drag in the cube for X/Y; set Z with its fader, the wheel or a pinch. ORBIT plays a 3D path; QUBIT lets a simulated two-qubit quantum state steer the point.
+- **Wet · dry · wet:** the bass stays dry and mono in the centre. The effects are high-passed sends on the sides, so the low end stays tight.
+- **End rack:** phaser, tremolo, auto filter, bitcrush, stutter and a looper.
+- **3D monitor:** a perspective spectrogram. Each slice is coloured by what it hears: tonal, mains hum, or white / pink / brown / blue / violet noise, judged from spectral flatness and slope. Drag it to tilt.
 
-## Controls
+## Feedback and phones
 
-Everything works with one mouse or one finger:
+- The output starts **muted** until you turn the monitor on.
+- **PHONE SAFE** turns on the browser's echo cancellation and caps the output at -9 dB. It's on by default on touch devices; turn it off for a clean interface line input.
+- The **feedback guard** notches frequencies that ring steadily for about a second. It ignores harmonics of the note being played, so sustained bass notes aren't touched. It also briefly ducks the master on a loud howl.
+- On phones:
+  - The 3D monitor sits at the top, with a tab bar (BASS / 3D / FX / MASTER) at the bottom.
+  - Knobs turn with a **left/right swipe**, so vertical swipes scroll the page.
 
-- **Knobs:** drag up/down or sideways, use the wheel, or the arrow keys. Double-tap resets a knob.
-- **Faders:** tap a fader track to jump there.
-- **Monitor:** Space toggles the monitor.
+## Low latency
 
-## Publishing on GitHub Pages
+There is one AudioWorklet for the whole voice. With LOWEST LATENCY on, the AudioContext asks for the smallest buffer. The interface input is opened raw, with no processing, at 48 kHz. The current latency is shown in the header.
 
-Go to **Settings → Pages → Deploy from a branch**, and pick the branch with `/ (root)`. Browsers only allow audio interface access on https or `localhost`. For local development, run `python3 -m http.server`.
+## Development (TypeScript)
 
-## TONE3000 setup (optional)
+The source is strict TypeScript in `src/`, bundled with esbuild into `dist/`. `dist/` is committed so GitHub Pages can serve the site without a build step.
+
+```
+npm install
+npm run typecheck   # tsc --noEmit (strict)
+npm run build       # bundles src/ -> dist/
+npm run watch       # rebuild on change
+npm run serve       # http://localhost:8000
+```
+
+CI (`.github/workflows/check.yml`) type-checks, builds, and fails if `dist/` is out of date.
+
+To publish: **Settings → Pages → Deploy from a branch**, pick the branch, `/ (root)`.
+
+## TONE3000 (optional)
 
 1. Create a publishable key at tone3000.com → Settings → API Keys.
 2. Register `https://xboxzero.github.io/DawSynthDoom/callback.html` as a redirect URI.
-3. Paste the `t3k_pub_…` key into the TONE3000 dialog.
+3. Paste the `t3k_pub_…` key in the BASS AMP panel's TONE3000 dialog.
 
 ## Credits
 
