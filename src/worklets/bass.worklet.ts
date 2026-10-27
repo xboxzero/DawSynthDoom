@@ -51,7 +51,7 @@ class BassHost extends AudioWorkletProcessor {
     this.inB = new Float32Array(buf, ex.in_ptr(), 128);
     this.outB = new Float32Array(buf, ex.out_ptr(), 128);
     this.params = new Float32Array(buf, ex.params_ptr(), DSP_PARAMS.length);
-    this.report = new Float32Array(buf, ex.report_ptr(), 10);
+    this.report = new Float32Array(buf, ex.report_ptr(), 12);
     this.ex = ex;
     this.port.postMessage({ ready: true });
   }
@@ -70,7 +70,7 @@ class BassHost extends AudioWorkletProcessor {
     const r = this.report;
     if (r[9] > 0) {
       r[9] = 0;
-      this.port.postMessage({ f0: r[0], out: r[1], midi: r[2], cents: r[3], err: r[4], amp: r[5], gate: r[6] > 0.5, lfo1: r[7], lfo2: r[8] });
+      this.port.postMessage({ f0: r[0], out: r[1], midi: r[2], cents: r[3], err: r[4], amp: r[5], gate: r[6] > 0.5, lfo1: r[7], lfo2: r[8], floor: r[10], locked: r[11] > 0.5 });
     }
     return true;
   }

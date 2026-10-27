@@ -36,7 +36,17 @@ SYNTH IN ─ BASS VOICE (C++ → WebAssembly) ─ PRE-AMP EQ ─ NAM BASS AMP + 
 
 - The output starts **muted** until you turn the monitor on.
 - **PHONE SAFE** turns on the browser's echo cancellation and caps the output at -9 dB. It's on by default on touch devices; turn it off for a clean interface line input.
-- The **feedback guard** notches frequencies that ring steadily for about a second. It ignores harmonics of the note being played, so sustained bass notes aren't touched. It also briefly ducks the master on a loud howl.
+- **No noise when you're not playing:**
+  - The DIRECT input is gated as well as the bass voice, so interface hiss and hum never reach the amp, compressor or reverb.
+  - **AUTO GATE** learns your noise floor and keeps the gate about 10 dB above it.
+  - The bass voice only plays while it has a locked pitch, so noise can't trigger random notes.
+  - The INPUT panel shows the noise floor and the gate level.
+- **Loop breaker:** the bass voice re-synthesises whatever it hears, so speaker → mic feedback can turn into a self-sustaining note.
+  - When the input is suspiciously steady, the engine dips the output 6 dB for 100 ms. If the input follows, it's our own sound coming back, and the output drops 24 dB for 1.5 s, which starves the loop.
+  - If the loop keeps coming back, the output stays 12 dB lower and PHONE SAFE turns on. RESET GUARD releases it.
+  - A real synth never follows our output, so held notes are left alone, and probes on a held note back off from every 2 s to every 16 s.
+- **Feedback guard:** cuts narrow notches only above 150 Hz, and only on peaks that keep ringing while the notes change, or while nothing is played. Bass notes and their harmonics are never notched. It also briefly ducks the master on a loud howl.
+- **Microphone inputs** (laptop, phone, webcam, headset) automatically switch on PHONE SAFE (echo cancellation). Audio interfaces stay raw.
 - On phones:
   - The 3D monitor sits at the top, with a tab bar (BASS / 3D / FX / MASTER) at the bottom.
   - Knobs turn with a **left/right swipe**, so vertical swipes scroll the page.

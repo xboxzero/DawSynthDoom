@@ -171,7 +171,7 @@ export class Engine {
   nam: { node: NamNode | null; loaded: boolean; name: string; info: NamModelInfo | null } = { node: null, loaded: false, name: '', info: null };
   cab = { name: 'Built-in bass cab' };
   revIR = { name: 'Built-in hall', user: false };
-  guard = { notches: [] as { idx: number; freq: number; gain: number }[], cand: new Map<number, { n: number; bin: number; peak: number; first: number }>(), duck: false };
+  guard = { notches: [] as { idx: number; freq: number; gain: number }[], cand: new Map<number, { n: number; bin: number; peak: number; first: number; notes: Set<number> }>(), duck: false };
   inputChannels = 1;
   inputLabel = '';
   irName = 'ROOM';
@@ -220,6 +220,7 @@ export class Engine {
   private compMakeup!: GainNode;
   private safeGain!: GainNode;
   private duck!: GainNode;
+  private loopKill!: GainNode;
   private guardAnalyser!: AnalyserNode;
   private guardSpec: Float32Array<ArrayBuffer> | null = null;
   private recDest!: MediaStreamAudioDestinationNode;
@@ -675,7 +676,7 @@ export class Engine {
     sm(md.lfo.frequency, this.reg.get('mod.rate'), this.ctx);
     sm(md.lfoR.gain, 1 - 2 * this.reg.get('mod.spread'), this.ctx);      // 0 = in phase, 1 = opposite
     for (const g of md.depth) sm(g.gain, depth * ((g as GainNode & { scale?: number }).scale ?? 0), this.ctx);
-    for (const g of md.fb) sm(g.gain, Math.min(0.9, this.reg.get('mod.fb')), this.ctx);
+    for (const g of md.fb) sm(g.gain, Math.min(0.75, this.reg.get('mod.fb')), this.ctx);   // capped: no runaway flanger
     sm(md.ring.frequency, this.reg.get('mod.ring'), this.ctx);
     sm(md.ringAmt.gain, depth, this.ctx);
     sm(md.tone.frequency, this.reg.get('mod.tone'), this.ctx);
@@ -764,8 +765,10 @@ export class Engine {
     this.compMakeup.connect(this.safeGain);
     this.duck = ctx.createGain();
     this.safeGain.connect(this.duck);
+    this.loopKill = ctx.createGain();
     this.master = ctx.createGain();
-    this.duck.connect(this.master);
+    this.duck.connect(this.loopKill);
+    this.loopKill.connect(this.master);
     const limiter = ctx.createDynamicsCompressor();
     limiter.threshold.value = -1; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.001; limiter.release.value = 0.08;
     this.master.connect(limiter);
@@ -810,17 +813,8 @@ export class Engine {
   // ───────────────────────── feedback guard ─────────────────────────
   // Finds narrow peaks far above their neighbours that hold or grow (feedback),
   // as opposed to notes that decay, and notches them. A loud howl ducks the master.
-  /** pitches currently being played (bass out + synth in), so the guard never notches the music */
+  /** pitches currently being played (bass out + synth in); the guard only notches peaks that outlast a note change */
   playing: number[] = [];
-
-  private isMusic(freq: number): boolean {
-    for (const f0 of this.playing) {
-      if (f0 <= 0) continue;
-      const k = Math.round(freq / f0);
-      if (k >= 1 && k <= 24 && Math.abs(freq / (k * f0) - 1) < 0.03) return true;
-    }
-    return false;
-  }
 
   guardTick(enabled: boolean, sensitivity: number): void {
     if (!this.started) return;
@@ -833,7 +827,8 @@ export class Engine {
     if (!this.guardSpec || this.guardSpec.length !== bins) this.guardSpec = new Float32Array(bins);
     an.getFloatFrequencyData(this.guardSpec);
     const s = this.guardSpec, hz = this.ctx.sampleRate / an.fftSize;
-    const lo = Math.ceil(70 / hz), hi = Math.min(bins - 41, Math.floor(12000 / hz));
+    // above 150 Hz only: bass fundamentals are never notched (low howls go to the loop breaker)
+    const lo = Math.ceil(150 / hz), hi = Math.min(bins - 41, Math.floor(12000 / hz));
     const thresholdDb = 30 - sensitivity * 18;
     const seen = new Set<number>();
     let loudest = -Infinity;
@@ -846,20 +841,139 @@ export class Engine {
       if (v - sum / cnt < thresholdDb) continue;
       const key = Math.round(i / 2);
       seen.add(key);
-      const c = g.cand.get(key) ?? { n: 0, bin: i, peak: v, first: v };
+      const c = g.cand.get(key) ?? { n: 0, bin: i, peak: v, first: v, notes: new Set<number>() };
       c.n++; c.bin = i; c.peak = v;
+      c.notes.add(this.playing[0] > 0 ? Math.round(12 * Math.log2(this.playing[0] / 440)) : -1);
       g.cand.set(key, c);
     }
     for (const [key, c] of g.cand) {
       if (!seen.has(key)) { c.n -= 2; if (c.n <= 0) g.cand.delete(key); continue; }
       // ~1 s of steady ringing that is not a harmonic of the note being played
       if (c.n >= 10) {
-        if (c.peak >= c.first - 1.5 && !this.isMusic(c.bin * hz)) this.placeNotch(c.bin * hz);
+        // Feedback rings whatever note you play; harmonics and distortion products
+        // move with the notes. So only notch a peak that survived a note change, or
+        // one that rings while nothing is being played. (A howl on a single held
+        // note is caught by the loop breaker's probe instead.)
+        const real = [...c.notes].filter((n) => n !== -1);
+        const ringsAcrossNotes = real.length >= 2 || real.length === 0;
+        // (A peak that stays put while the notes change cannot be their harmonic,
+        // so no harmonic exemption here: with dense bass harmonics it would hide real howls.)
+        if (c.peak >= c.first - 1.5 && ringsAcrossNotes) this.placeNotch(c.bin * hz);
         g.cand.delete(key);
       }
     }
-    const howl = loudest > -4 && [...g.cand.values()].some((c) => c.n >= 4 && !this.isMusic(c.bin * hz));
+    const howl = loudest > -4 && [...g.cand.values()].some((c) => c.n >= 4 && [...c.notes].filter((n) => n !== -1).length >= 2);
     if (howl !== g.duck) { g.duck = howl; sm(this.duck.gain, howl ? 0.3 : 1, this.ctx, howl ? 0.01 : 0.8); }
+    this.loopBreaker();
+  }
+
+  // ───────────────────────── loop breaker ─────────────────────────
+  // The bass voice re-synthesises whatever it hears, so speaker → mic feedback
+  // becomes a self-sustaining note that narrow notches cannot stop, and it can
+  // settle at a steady level that looks just like a held note.
+  //
+  // So when the input is suspiciously steady, the engine asks the room: it dips
+  // the output 6 dB for 80 ms. If the input follows the dip, the input is our own
+  // output coming back → feedback → the output drops 24 dB for 1.5 s (which
+  // starves the loop), then fades back. A real synth never reacts to our output,
+  // so held notes are left alone.
+  private readonly tdBuf = new Float32Array(8192);
+  private readonly fastBuf = new Float32Array(2048);
+  private inFast!: AnalyserNode;
+  private inHist: number[] = [];
+  private pinned = 0;
+  private breakUntil = 0;
+  private nextProbe = 0;
+  private probing = false;
+  private probeGap = 2;   // seconds between probes; doubles while a held note keeps proving clean
+  private breaks: number[] = [];
+  loopHold = false;   // stays reduced after repeated loops, until the user resets
+
+  private level(an: AnalyserNode, buf: Float32Array<ArrayBuffer>): { peak: number; rms: number } {
+    an.getFloatTimeDomainData(buf);
+    let pk = 0, sum = 0;
+    for (const v of buf) { const a = Math.abs(v); if (a > pk) pk = a; sum += v * v; }
+    return { peak: 20 * Math.log10(pk + 1e-9), rms: 10 * Math.log10(sum / buf.length + 1e-18) };
+  }
+
+  private breakLoop(reason: string): void {
+    const now = this.ctx.currentTime;
+    this.breakUntil = now + 1.5;
+    this.breaks = this.breaks.filter((t) => now - t < 30);
+    this.breaks.push(now);
+    this.loopKill.gain.cancelScheduledValues(now);
+    this.loopKill.gain.setTargetAtTime(dbToLin(-24), now, 0.004);
+    if (this.breaks.length >= 2) {
+      this.loopHold = true;
+      this.onStatus('howl-repeat', 'Feedback keeps coming back: output held 12 dB lower and PHONE SAFE switched on. Use headphones, turn the speaker away from the mic, or lower MASTER.');
+    } else {
+      this.onStatus('howl', `Feedback loop stopped (${reason}).`);
+    }
+  }
+
+  // Robust probe: 42 ms windows (longer than a bass cycle), quietest of three
+  // readings before the dip vs loudest during it — level wobble can't fake a drop.
+  private probe(): void {
+    this.probing = true;
+    const read = (): number => this.level(this.inFast, this.fastBuf).rms;
+    const base: number[] = [];
+    const takeBase = (): void => {
+      base.push(read());
+      if (base.length < 3) { window.setTimeout(takeBase, 15); return; }
+      const t0 = this.ctx.currentTime;
+      const g = this.loopKill.gain;
+      const cur = g.value;
+      g.cancelScheduledValues(t0);
+      g.setValueAtTime(cur, t0);
+      g.linearRampToValueAtTime(cur * 0.5, t0 + 0.005);      // -6 dB for 100 ms
+      g.setValueAtTime(cur * 0.5, t0 + 0.1);
+      g.linearRampToValueAtTime(cur, t0 + 0.105);
+      const dipped: number[] = [];
+      const takeDip = (): void => {
+        dipped.push(read());
+        if (dipped.length < 2) { window.setTimeout(takeDip, 15); return; }
+        this.probing = false;
+        if (Math.min(...base) - Math.max(...dipped) > 3) { this.probeGap = 2; this.breakLoop('the input followed the output'); }
+        else this.probeGap = Math.min(16, this.probeGap * 2);   // clean: probe a held note less and less often
+      };
+      window.setTimeout(takeDip, 65);   // window now lies inside the dip (+ room delay)
+    };
+    takeBase();
+  }
+
+  private loopBreaker(): void {
+    if (!this.inFast) {
+      this.inFast = this.ctx.createAnalyser();
+      this.inFast.fftSize = 2048;   // ~42 ms window
+      this.inTrim.connect(this.inFast);
+    }
+    const now = this.ctx.currentTime;
+    const out = this.level(this.guardAnalyser, this.tdBuf), inp = this.level(this.inAnalyser, this.tdBuf);
+    this.inHist.push(inp.rms);
+    if (this.inHist.length > 12) this.inHist.shift();
+    const steadyInput = this.inHist.length >= 10 && Math.max(...this.inHist) - Math.min(...this.inHist) < 3 && inp.rms > -45;
+    if (!steadyInput) this.probeGap = 2;   // the music moved: back to quick checks
+    const breaking = now < this.breakUntil;
+    // backstop: output stuck at the limiter on a steady input
+    this.pinned = out.peak > -4.5 && steadyInput ? this.pinned + 1 : 0;
+    if (!breaking && this.pinned >= 10) { this.pinned = 0; this.breakLoop('output stuck at the limiter'); return; }
+    // the probe: is the steady input actually our own output?
+    if (!breaking && !this.probing && steadyInput && out.peak > -35 && now > this.nextProbe && this.monitor.gain.value > 0.5) {
+      this.nextProbe = now + this.probeGap;
+      this.probe();
+      return;
+    }
+    if (!breaking && this.breakUntil > 0) {
+      this.breakUntil = 0;
+      this.loopKill.gain.cancelScheduledValues(now);
+      this.loopKill.gain.setTargetAtTime(this.loopHold ? dbToLin(-12) : 1, now, 1);   // fade back over ~3 s
+    }
+  }
+
+  releaseLoopHold(): void {
+    this.loopHold = false;
+    this.breaks = [];
+    if (this.loopKill) sm(this.loopKill.gain, 1, this.ctx, 0.5);
   }
 
   private placeNotch(freq: number): void {
@@ -881,7 +995,7 @@ export class Engine {
     this.guard.notches = [];
     this.guard.cand.clear();
     this.guard.duck = false;
-    if (this.duck) sm(this.duck.gain, 1, this.ctx, 0.3);
+    if (this.duck) sm(this.duck.gain, 1, this.ctx, 0.3);    this.releaseLoopHold();
   }
 
   // ───────────────────────── recording + info ─────────────────────────

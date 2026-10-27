@@ -94,6 +94,7 @@ enum P {
   GATE, SENS, KEY, SCALE_ID, TEMPER_ID, REF, QUANT, GLIDE, OCTAVE, RANGE,
   SHAPE, SUB, NOISE, BLEND, CUTOFF, RESO, ENV_AMT, DRIVE, FOLD, ATTACK, RELEASE, LEVEL,
   L1_RATE, L1_SHAPE, L1_DEPTH, L1_DEST, L2_RATE, L2_SHAPE, L2_DEPTH, L2_DEST, LFO_RETRIG,
+  AUTO_GATE,
   NPARAMS
 };
 enum Dest { D_NONE, D_CUTOFF, D_PITCH, D_AMP, D_FOLD, D_SHAPE, D_DRIVE, D_RESO, D_SUB };
@@ -105,13 +106,16 @@ constexpr int DECIM = 4;
 static float in_buf[BLOCK];
 static float out_buf[BLOCK];
 static float params[NPARAMS];
-static float report[10];
+static float report[12];
 
 static float sr = 48000.f, ana_rate = 12000.f;
 
 // state
 static float dc_x, dc_y, env, amp, hold;
-static bool open_gate, voiced;
+static bool open_gate, voiced, locked;
+static int miss;
+static float gate_gain;            // smoothed gate for the direct path
+static float floor_env = 0.001f;   // learned noise floor (linear)
 static float ring[RING], buf[RING], diffv[512];
 static int ring_pos, acc_n, hop;
 static float lp, acc, period, f0, last_raw;
@@ -170,7 +174,7 @@ static void detect() {
     // no dip under the strict threshold (noisy, weak or rich input):
     // take the deepest dip if it is still clearly periodic (standard YIN fallback)
     int best = -1;
-    float bv = 0.35f;
+    float bv = 0.25f;
     for (int tau = tau_min; tau < tau_max; tau++) if (diffv[tau] < bv) { bv = diffv[tau]; best = tau; }
     found = best;
   }
@@ -260,6 +264,11 @@ EXPORT(process) void process(int n) {
   const float fg = (1.f + fold * 5.f) * 1.2f;
   const float fold_mix = m::minf(1.f, fold * 2.5f);
   const float hold_samples = sr * 0.03f;
+  const bool auto_gate = P_[AUTO_GATE] >= 0.5f;
+  const float floor_down = 1.f - m::expf(-1.f / (0.05f * sr));   // follows quieter levels quickly
+  const float floor_up = 1.f - m::expf(-1.f / (6.f * sr));       // creeps up slowly, only without a pitch
+  const float gg_open = 1.f - m::expf(-1.f / (0.001f * sr));
+  const float gg_close = 1.f - m::expf(-1.f / (0.06f * sr));
   const float nyq = sr * 0.42f;
 
   for (int i = 0; i < n; i++) {
@@ -270,8 +279,13 @@ EXPORT(process) void process(int n) {
 
     const float ax = m::absf(x);
     env += (ax - env) * (ax > env ? env_atk : env_rel);
-    if (env > thr) { open_gate = true; hold = hold_samples; }
-    else if (env < thr * 0.5f) { if (hold > 0) hold -= 1.f; else open_gate = false; }
+    // learn the noise floor (hiss/hum) and keep the gate ~10 dB above it
+    if (env < floor_env) floor_env += (env - floor_env) * floor_down;
+    else if (!locked) floor_env += (env - floor_env) * floor_up;
+    const float gthr = auto_gate ? m::minf(m::maxf(thr, floor_env * 3.2f), 0.1f) : thr;
+    if (env > gthr) { open_gate = true; hold = hold_samples; }
+    else if (env < gthr * 0.5f) { if (hold > 0) hold -= 1.f; else open_gate = false; }
+    gate_gain += ((open_gate ? 1.f : 0.f) - gate_gain) * (open_gate ? gg_open : gg_close);
 
     lp += (x - lp) * lp_coef;
     acc += lp;
@@ -287,6 +301,9 @@ EXPORT(process) void process(int n) {
           // retune only when two detections in a row agree (rejects octave blips)
           const bool agree = voiced && last_raw > 0 && m::absf(m::log2f(f0 / last_raw)) < 0.04f;
           last_raw = voiced ? f0 : 0.f;
+          // the voice only plays while the pitch is locked: noise never triggers notes
+          if (agree) { locked = true; miss = 0; }
+          else if (++miss >= 4) locked = false;
           if (agree) {
             float midi = 69.f + 12.f * m::log2f(f0 / ref) + static_cast<float>(octave * 12);
             if (range) { while (midi >= 52.f) midi -= 12.f; while (midi < 28.f) midi += 12.f; }
@@ -297,6 +314,7 @@ EXPORT(process) void process(int n) {
           }
         } else {
           voiced = false;
+          locked = false;
           period = 0.f;
           last_raw = 0.f;
         }
@@ -330,7 +348,7 @@ EXPORT(process) void process(int n) {
 
     const float drive_in = env * sens;
     // square-root-ish curve: quiet inputs (mic, low interface gain) still give a usable level
-    const float want = open_gate && (voiced || amp > 0.002f) ? m::minf(1.f, drive_in < 1.f ? drive_in * (2.f - drive_in) : 1.f) : 0.f;
+    const float want = open_gate && (locked || (voiced && amp > 0.002f)) ? m::minf(1.f, drive_in < 1.f ? drive_in * (2.f - drive_in) : 1.f) : 0.f;
     amp += (want - amp) * (want > amp ? atk : rel);
 
     const float fc = m::minf(cutoff * m::exp2f(env_amt * 5.f * m::minf(1.f, env * sens)), nyq);
@@ -342,7 +360,7 @@ EXPORT(process) void process(int n) {
     s4 += g * (s3 - s4);
     float z = s4 * (1.f + k * 0.35f);
     z = m::tanhf(z * dg) * d_norm * 0.7f;
-    out_buf[i] = z * amp * amp_mod * level + x * blend;
+    out_buf[i] = z * amp * amp_mod * level + x * blend * gate_gain;   // direct input is gated too
   }
 
   if (++report_count >= 12) {
@@ -357,5 +375,7 @@ EXPORT(process) void process(int n) {
     report[7] = lfo_val[0];
     report[8] = lfo_val[1];
     report[9] = 1.f;   // fresh report flag
+    report[10] = floor_env;
+    report[11] = locked ? 1.f : 0.f;
   }
 }

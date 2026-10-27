@@ -16,7 +16,7 @@ const $ = <T extends HTMLElement = HTMLElement>(s: string): T => {
   return e;
 };
 
-const STATE_KEY = 'dsd.state.v4';
+const STATE_KEY = 'dsd.state.v5';
 const STARTER = 'https://raw.githubusercontent.com/tone-3000/neural-amp-modeler-wasm/refs/heads/main/ui/public/';
 const touch = isTouchDevice();
 
@@ -60,6 +60,7 @@ function defineParams(): void {
   D({ id: 'bass.gate', label: 'GATE', min: -80, max: -20, def: -54, unit: 'dB', apply: live((v) => engine.setBass('gateThresh', 10 ** (v / 20))) });
   D({ id: 'bass.sens', label: 'SENS', min: 0.5, max: 20, def: 6, scale: 'log', apply: bass('sens') });
   D({ id: 'in.auto', label: 'AUTO CHANNEL', def: 1, step: 1 });
+  D({ id: 'bass.autogate', label: 'AUTO GATE', def: 1, step: 1, apply: bass('autoGate') });
 
   D({ id: 'tune.key', label: 'KEY', min: 0, max: 11, def: 0, step: 1, options: NOTE_NAMES, apply: bass('key') });
   D({ id: 'tune.scale', label: 'SCALE', min: 0, max: SCALES.length - 1, def: 2, step: 1, options: SCALES.map((s) => s.name), apply: bass('scale') });
@@ -82,7 +83,7 @@ function defineParams(): void {
   D({ id: 'bass.release', label: 'RELEASE', min: 5, max: 2000, def: 120, scale: 'log', unit: 'ms', apply: bass('release') });
   D({ id: 'bass.level', label: 'LEVEL', max: 1.5, def: 0.8, unit: '%', apply: bass('level') });
   // DIRECT: your input itself, always audible even when the bass voice can't find a pitch
-  D({ id: 'bass.blend', label: 'DIRECT', def: 0.35, unit: '%', apply: bass('blend') });
+  D({ id: 'bass.blend', label: 'DIRECT', def: 0.3, unit: '%', apply: bass('blend') });
 
   const amp = live(() => engine.applyAmpRouting());
   D({ id: 'amp.on', label: 'NAM AMP', def: 0, step: 1, apply: amp });
@@ -175,7 +176,7 @@ function defineParams(): void {
     D({ id: `eq.${i}.g`, label: 'GAIN', min: -18, max: 18, def: 0, unit: 'dB', apply: () => applyEq(i) });
     D({ id: `eq.${i}.q`, label: 'Q', min: 0.3, max: 10, def: b.q, scale: 'log', apply: () => applyEq(i) });
   });
-  D({ id: 'master.comp', label: 'GLUE', def: 0.25, unit: '%', apply: live((v) => engine.setComp(v)) });
+  D({ id: 'master.comp', label: 'GLUE', def: 0.15, unit: '%', apply: live((v) => engine.setComp(v)) });
   D({ id: 'guard.on', label: 'FB GUARD', def: 1, step: 1 });
   D({ id: 'guard.sens', label: 'SENSE', def: 0.5, unit: '%' });
   D({ id: 'master.vol', label: 'MASTER', def: 0.62, format: fmtFader, apply: live((v) => engine.master.gain.setTargetAtTime(faderGain(v), engine.ctx.currentTime, 0.015)) });
@@ -243,7 +244,10 @@ function buildInput(): void {
     el('span', '', c).textContent = label;
     c.addEventListener('click', () => reg.set('in.ch', i));
   });
-  toggle(host, reg, 'in.auto', { text: 'AUTO CHANNEL', cls: 'small', title: 'Switch to the input that has signal' });
+  const tg = el('div', 'p-btns', host);
+  toggle(tg, reg, 'in.auto', { text: 'AUTO CHANNEL', cls: 'small', title: 'Switch to the input that has signal' });
+  toggle(tg, reg, 'bass.autogate', { text: 'AUTO GATE', cls: 'small', title: 'Learn the noise floor and keep the gate above it' });
+  el('div', 'floor', host).id = 'floorInfo';
   const st = el('div', 'in-status', host);
   st.id = 'inStatus';
   st.textContent = 'Press START, then allow audio input.';
@@ -486,7 +490,7 @@ function buildMaster(): void {
   toggle(el('div', 'p-btns', g), reg, 'guard.on', { text: 'FEEDBACK GUARD' });
   knobs(g, ['guard.sens', 'master.comp']);
   el('div', 'g-list', g).id = 'guardList';
-  button(g, 'RESET NOTCHES', () => engine.resetGuard(), 'ghost small');
+  button(g, 'RESET GUARD', () => engine.resetGuard(), 'ghost small');
   const vol = el('div', 'm-vol', side);
   const f = fader(vol, reg, 'master.vol');
   f.root.classList.add('big');
@@ -584,6 +588,13 @@ async function openInput(id: string | undefined): Promise<void> {
   }
   currentInput = id;
   $('#inputName').textContent = label;
+  // a built-in / laptop / phone microphone hears the speakers: turn on echo cancellation
+  const isMic = /built-?in|internal|microphone array|iphone|ipad|headset|webcam|camera|default/i.test(label) && !/line|instrument|focusrite|scarlett|audient|motu|presonus|steinberg|behringer|umc|rme|apollo|zoom|tascam|roland|boss|komplete|ssl/i.test(label);
+  if (isMic && !reg.on('safe.on')) {
+    reg.set('safe.on', 1);   // reopens the input with echo cancellation
+    toast('Microphone input: PHONE SAFE (echo cancellation) switched on to stop feedback.', 'warn');
+    return;
+  }
   inputStatus(`● ${label || 'audio input'} · ${engine.inputChannels} ch${reg.on('safe.on') ? ' · phone safe' : ''}`);
   if (reg.on('safe.on') && !touch && !/built-?in|internal|default|microphone|mic\b/i.test(label)) {
     toast('This looks like an audio interface: you can turn PHONE SAFE off for the rawest signal.', 'warn');
@@ -895,6 +906,12 @@ function frame(): void {
 }
 
 function onBass(d: BassReport): void {
+  const fi = document.getElementById('floorInfo');
+  if (fi) {
+    const floorDb = 20 * Math.log10(d.floor + 1e-9);
+    const gateDb = reg.on('bass.autogate') ? Math.min(-20, Math.max(reg.get('bass.gate'), floorDb + 10)) : reg.get('bass.gate');
+    fi.textContent = `noise floor ${floorDb.toFixed(0)} dB · gate ${gateDb.toFixed(0)} dB · ${d.gate ? 'OPEN' : 'closed'}${d.locked ? ' · pitch locked' : ''}`;
+  }
   for (const [n, v] of [[1, d.lfo1], [2, d.lfo2]] as const) {
     const bar = document.getElementById(`lfo${n}Bar`);
     if (bar) bar.style.left = `${(v * 0.5 + 0.5) * 100}%`;
@@ -941,6 +958,8 @@ engine.onStatus = (kind, text) => {
   }
   if (kind === 'input-ended') { inputStatus(`${text} Reconnect it and press RETRY INPUT.`, true); toast(text, 'err'); return; }
   if (kind === 'ir') { buildIrSim(); return; }
+  if (kind === 'howl') { toast(text, 'warn'); return; }
+  if (kind === 'howl-repeat') { toast(text, 'err'); if (!reg.on('safe.on')) reg.set('safe.on', 1); return; }
   if (kind.endsWith('error')) toast(text, 'err');
   else if (kind === 'guard') toast(text, 'warn');
   if (kind.startsWith('nam')) buildAmp();
