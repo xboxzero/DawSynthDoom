@@ -12,6 +12,7 @@ interface BassExports {
   report_ptr(): number;
   param_count(): number;
   init(sampleRate: number): void;
+  set_clock(t: number): void;
   process(n: number): void;
 }
 
@@ -51,7 +52,7 @@ class BassHost extends AudioWorkletProcessor {
     this.inB = new Float32Array(buf, ex.in_ptr(), 128);
     this.outB = new Float32Array(buf, ex.out_ptr(), 128);
     this.params = new Float32Array(buf, ex.params_ptr(), DSP_PARAMS.length);
-    this.report = new Float32Array(buf, ex.report_ptr(), 12);
+    this.report = new Float32Array(buf, ex.report_ptr(), 14);
     this.ex = ex;
     this.port.postMessage({ ready: true });
   }
@@ -64,13 +65,14 @@ class BassHost extends AudioWorkletProcessor {
     for (let i = 0; i < DSP_PARAMS.length; i++) this.params[i] = prm[DSP_PARAMS[i][0]][0];
     const inp = inputs[0]?.[0];
     if (inp) this.inB.set(inp); else this.inB.fill(0);
+    ex.set_clock(currentTime);   // shared grid for the bass patterns (drums use the same clock)
     ex.process(n);
     out[0].set(this.outB.subarray(0, n));
     for (let c = 1; c < out.length; c++) out[c].set(out[0]);
     const r = this.report;
     if (r[9] > 0) {
       r[9] = 0;
-      this.port.postMessage({ f0: r[0], out: r[1], midi: r[2], cents: r[3], err: r[4], amp: r[5], gate: r[6] > 0.5, lfo1: r[7], lfo2: r[8], floor: r[10], locked: r[11] > 0.5 });
+      this.port.postMessage({ f0: r[0], out: r[1], midi: r[2], cents: r[3], err: r[4], amp: r[5], gate: r[6] > 0.5, lfo1: r[7], lfo2: r[8], floor: r[10], locked: r[11] > 0.5, step: r[12], any: r[13] > 0.5 });
     }
     return true;
   }

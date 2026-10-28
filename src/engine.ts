@@ -10,6 +10,7 @@
 import { NamEngine, type NamModelInfo, type NamNode } from '../vendor/nam/nam-engine.js';
 import type { Registry } from './params';
 import { Rack } from './rack';
+import { Groove } from './groove';
 import type { BandDef } from './eq';
 import type { BassReport } from './dsp-params';
 export type { BassReport } from './dsp-params';
@@ -41,7 +42,7 @@ export const PRE_BANDS: readonly BandDef[] = [
 ];
 
 export const MOD_TYPES = ['CHORUS', 'FLANGER', 'VIBRATO', 'PHASER', 'ROTARY', 'RING', 'AUTOPAN'] as const;
-export const IR_TYPES = ['ROOM', 'PLATE', 'HALL', 'SPRING', 'BASS CAB', 'RADIO', 'PHONE'] as const;
+export const IR_TYPES = ['ROOM', 'PLATE', 'HALL', 'SPRING', 'BASS CAB', 'RADIO', 'PHONE', 'SAND DUNE'] as const;
 export const INPUT_CHANNELS = ['IN 1', 'IN 2', 'IN 3', 'IN 4', '1+2'] as const;
 
 /** Explain a getUserMedia failure in plain words. */
@@ -66,7 +67,7 @@ interface Wet {
 /** Built-in impulse responses for the end-of-chain IR sim, rendered offline. */
 async function makeIR(rate: number, type: number): Promise<AudioBuffer> {
   const name = IR_TYPES[type] ?? 'ROOM';
-  const secs = { ROOM: 0.5, PLATE: 1.8, HALL: 3.2, SPRING: 1.6, 'BASS CAB': 0.05, RADIO: 0.03, PHONE: 0.03 }[name];
+  const secs = { ROOM: 0.5, PLATE: 1.8, HALL: 3.2, SPRING: 1.6, 'BASS CAB': 0.05, RADIO: 0.03, PHONE: 0.03, 'SAND DUNE': 5 }[name];
   const len = Math.max(256, Math.floor(rate * secs));
   const off = new OfflineAudioContext(2, len, rate);
   const src = off.createBufferSource();
@@ -74,6 +75,23 @@ async function makeIR(rate: number, type: number): Promise<AudioBuffer> {
   for (let ch = 0; ch < 2; ch++) {
     const d = raw.getChannelData(ch);
     if (name === 'BASS CAB' || name === 'RADIO' || name === 'PHONE') { d[0] = 1; continue; }
+    if (name === 'SAND DUNE') {
+      // Open desert: almost no early reflections, a few soft distant slaps off dune
+      // faces, a long airy tail that loses its highs quickly (sand absorbs them),
+      // a faint "singing sand" drone around 95 Hz and wind-like slow swirl.
+      let lp = 0;
+      const echoes = ch === 0 ? [0.19, 0.47, 0.83, 1.31] : [0.23, 0.55, 0.97, 1.42];
+      for (let i = 0; i < len; i++) {
+        const sec = i / rate, t = i / len;
+        const swirl = 0.75 + 0.25 * Math.sin(2 * Math.PI * (0.31 + ch * 0.07) * sec);
+        lp += ((Math.random() * 2 - 1) - lp) * (0.5 * Math.exp(-sec * 1.4) + 0.02);   // darker over time
+        let v = lp * Math.pow(1 - t, 1.3) * swirl * 0.6 * Math.min(1, sec / 0.06);
+        v += Math.sin(2 * Math.PI * 95 * sec + ch) * 0.05 * Math.exp(-sec * 0.8) * Math.min(1, sec / 0.3);
+        for (const e of echoes) { const di = sec - e; if (di >= 0 && di < 0.04) v += (Math.random() * 2 - 1) * 0.35 * Math.exp(-di * 90) * Math.exp(-e * 1.2); }
+        d[i] = v;
+      }
+      continue;
+    }
     for (let i = 0; i < len; i++) {
       const t = i / len;
       let v = (Math.random() * 2 - 1) * Math.pow(1 - t, name === 'PLATE' ? 1.6 : 2.4);
@@ -89,6 +107,7 @@ async function makeIR(rate: number, type: number): Promise<AudioBuffer> {
     'BASS CAB': [['highpass', 38, 0.7, 0], ['peaking', 70, 1, 3], ['peaking', 400, 1.2, -4], ['peaking', 1800, 1.5, 3], ['lowpass', 4200, 0.8, 0], ['lowpass', 5500, 0.7, 0]],
     RADIO: [['highpass', 450, 0.9, 0], ['peaking', 1500, 1.2, 6], ['lowpass', 3200, 1.2, 0]],
     PHONE: [['highpass', 320, 1.4, 0], ['highpass', 320, 1.4, 0], ['lowpass', 3400, 1.4, 0], ['lowpass', 3400, 1.4, 0]],
+    'SAND DUNE': [['highpass', 50, 0.7, 0], ['highshelf', 3000, 0.7, -6], ['lowpass', 9000, 0.7, 0]],
   }[name] as [BiquadFilterType, number, number, number][];
   let node: AudioNode = src;
   for (const [t, f, q, g] of filters) {
@@ -171,7 +190,7 @@ export class Engine {
   nam: { node: NamNode | null; loaded: boolean; name: string; info: NamModelInfo | null } = { node: null, loaded: false, name: '', info: null };
   cab = { name: 'Built-in bass cab' };
   revIR = { name: 'Built-in hall', user: false };
-  guard = { notches: [] as { idx: number; freq: number; gain: number }[], cand: new Map<number, { n: number; bin: number; peak: number; first: number; notes: Set<number> }>(), duck: false };
+  guard = { notches: [] as { idx: number; freq: number; gain: number }[], cand: new Map<number, { n: number; bin: number; peak: number; first: number; notes: Set<number>; fund: Set<number> }>(), duck: false };
   inputChannels = 1;
   inputLabel = '';
   irName = 'ROOM';
@@ -221,6 +240,16 @@ export class Engine {
   private safeGain!: GainNode;
   private duck!: GainNode;
   private loopKill!: GainNode;
+  pump!: GainNode;
+  groove!: Groove;
+  final = {} as { hp: BiquadFilterNode; low: BiquadFilterNode; punch: BiquadFilterNode; presence: BiquadFilterNode; harm: GainNode; loud: GainNode };
+
+  setFinal(o: { hp: number; low: number; punch: number; presence: number; harm: number; loud: number }): void {
+    const f = this.final;
+    if (!f.hp) return;
+    sm(f.hp.frequency, o.hp, this.ctx); sm(f.low.gain, o.low, this.ctx); sm(f.punch.gain, o.punch, this.ctx);
+    sm(f.presence.gain, o.presence, this.ctx); sm(f.harm.gain, o.harm * 1.2, this.ctx); sm(f.loud.gain, dbToLin(o.loud), this.ctx);
+  }
   private guardAnalyser!: AnalyserNode;
   private guardSpec: Float32Array<ArrayBuffer> | null = null;
   private recDest!: MediaStreamAudioDestinationNode;
@@ -729,8 +758,12 @@ export class Engine {
   private buildMaster(): void {
     const ctx = this.ctx;
     const mix = ctx.createGain();
-    this.dryPan.connect(mix);
-    this.wetGain.connect(mix);
+    this.pump = ctx.createGain();                 // sidechain pump from the drum groove
+    this.dryPan.connect(this.pump);
+    this.wetGain.connect(this.pump);
+    this.pump.connect(mix);
+    this.groove = new Groove(ctx, this.pump);
+    this.groove.out.connect(mix);
     this.mixAnalyser = ctx.createAnalyser();
     this.mixAnalyser.fftSize = 4096;
     this.mixAnalyser.smoothingTimeConstant = 0.8;
@@ -767,13 +800,42 @@ export class Engine {
     this.safeGain.connect(this.duck);
     this.loopKill = ctx.createGain();
     this.master = ctx.createGain();
-    this.duck.connect(this.loopKill);
-    this.loopKill.connect(this.master);
+    this.duck.connect(this.master);
     const limiter = ctx.createDynamicsCompressor();
     limiter.threshold.value = -1; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.001; limiter.release.value = 0.08;
-    this.master.connect(limiter);
+    // FINAL BOOST: speaker-protect high-pass, low / punch / presence EQ, bass
+    // harmonics (so small speakers and guitar amps can still hear the bass) and a
+    // loudness push into the limiter.
+    const fin = this.final;
+    fin.hp = ctx.createBiquadFilter(); fin.hp.type = 'highpass'; fin.hp.Q.value = 0.7;
+    fin.low = ctx.createBiquadFilter(); fin.low.type = 'lowshelf'; fin.low.frequency.value = 90;
+    fin.punch = ctx.createBiquadFilter(); fin.punch.type = 'peaking'; fin.punch.frequency.value = 250; fin.punch.Q.value = 0.9;
+    fin.presence = ctx.createBiquadFilter(); fin.presence.type = 'highshelf'; fin.presence.frequency.value = 3500;
+    fin.loud = ctx.createGain();
+    this.master.connect(fin.low); fin.low.connect(fin.punch); fin.punch.connect(fin.presence); fin.presence.connect(fin.hp); fin.hp.connect(fin.loud);
+    const hb = ctx.createBiquadFilter(); hb.type = 'lowpass'; hb.frequency.value = 160;
+    const hs = ctx.createWaveShaper();
+    const hc = new Float32Array(2048);
+    for (let i = 0; i < hc.length; i++) { const x = (i / (hc.length - 1)) * 2 - 1; hc[i] = Math.tanh(3 * Math.abs(x)) * 0.7 + Math.tanh(3 * x) * 0.3; }   // even + odd harmonics
+    hs.curve = hc;
+    const hh = ctx.createBiquadFilter(); hh.type = 'highpass'; hh.frequency.value = 140;
+    const hl = ctx.createBiquadFilter(); hl.type = 'lowpass'; hl.frequency.value = 900;
+    fin.harm = ctx.createGain(); fin.harm.gain.value = 0;
+    this.master.connect(hb); hb.connect(hs); hs.connect(hh); hh.connect(hl); hl.connect(fin.harm); fin.harm.connect(fin.loud);
+    fin.loud.connect(limiter);
     const out = ctx.createGain();
-    limiter.connect(out);
+    // the loop breaker sits last, after the limiter, so its probe dips and cuts are real at the speaker
+    // true ceiling: the compressor-limiter can overshoot, so a soft clipper catches the rest (max ≈ -0.5 dBFS)
+    const ceiling = ctx.createWaveShaper();
+    const cc = new Float32Array(4096);
+    for (let i = 0; i < cc.length; i++) { const x = ((i / (cc.length - 1)) * 2 - 1) * 2; cc[i] = 0.944 * Math.tanh(x / 0.944); }
+    ceiling.curve = cc;
+    ceiling.oversample = '2x';
+    // the shaper reads inputs in ±1, so feed it x/2 and let the curve handle the real ±2 range
+    const pre = ctx.createGain(); pre.gain.value = 0.5;
+    limiter.connect(pre); pre.connect(ceiling);
+    ceiling.connect(this.loopKill);
+    this.loopKill.connect(out);
     this.outAnalyser = ctx.createAnalyser();
     this.outAnalyser.fftSize = 8192;
     this.outAnalyser.smoothingTimeConstant = 0.55;
@@ -804,7 +866,8 @@ export class Engine {
   }
 
   /** phone-safe mode caps the output at -9 dB */
-  setSafe(on: boolean): void { if (this.safeGain) sm(this.safeGain.gain, on ? dbToLin(-9) : 1, this.ctx, 0.05); }
+  /** phone-safe caps the output at -4 dB (feedback itself is handled by the loop breaker) */
+  setSafe(on: boolean): void { if (this.safeGain) sm(this.safeGain.gain, on ? dbToLin(-4) : 1, this.ctx, 0.05); }
   async setOutputDevice(id: string): Promise<void> {
     const c = this.ctx as AudioContext & { setSinkId?: (id: string) => Promise<void> };
     await c.setSinkId?.(id);
@@ -815,6 +878,15 @@ export class Engine {
   // as opposed to notes that decay, and notches them. A loud howl ducks the master.
   /** pitches currently being played (bass out + synth in); the guard only notches peaks that outlast a note change */
   playing: number[] = [];
+
+  /** a low harmonic (k ≤ 12, within 1.5%) of any pitch heard while the peak rang */
+  private harmonicOf(freq: number, fund: Set<number>): boolean {
+    for (const f of fund) {
+      const k = Math.round(freq / f);
+      if (k >= 1 && k <= 12 && Math.abs(freq / (k * f) - 1) < 0.015) return true;
+    }
+    return false;
+  }
 
   guardTick(enabled: boolean, sensitivity: number): void {
     if (!this.started) return;
@@ -841,9 +913,10 @@ export class Engine {
       if (v - sum / cnt < thresholdDb) continue;
       const key = Math.round(i / 2);
       seen.add(key);
-      const c = g.cand.get(key) ?? { n: 0, bin: i, peak: v, first: v, notes: new Set<number>() };
+      const c = g.cand.get(key) ?? { n: 0, bin: i, peak: v, first: v, notes: new Set<number>(), fund: new Set<number>() };
       c.n++; c.bin = i; c.peak = v;
       c.notes.add(this.playing[0] > 0 ? Math.round(12 * Math.log2(this.playing[0] / 440)) : -1);
+      for (const f of this.playing) if (f > 0) { c.fund.add(Math.round(f)); c.fund.add(Math.round(f / 2)); }   // note + its sub
       g.cand.set(key, c);
     }
     for (const [key, c] of g.cand) {
@@ -858,7 +931,7 @@ export class Engine {
         const ringsAcrossNotes = real.length >= 2 || real.length === 0;
         // (A peak that stays put while the notes change cannot be their harmonic,
         // so no harmonic exemption here: with dense bass harmonics it would hide real howls.)
-        if (c.peak >= c.first - 1.5 && ringsAcrossNotes) this.placeNotch(c.bin * hz);
+        if (c.peak >= c.first - 1.5 && ringsAcrossNotes && !this.harmonicOf(c.bin * hz, c.fund)) this.placeNotch(c.bin * hz);
         g.cand.delete(key);
       }
     }
@@ -878,16 +951,16 @@ export class Engine {
   // starves the loop), then fades back. A real synth never reacts to our output,
   // so held notes are left alone.
   private readonly tdBuf = new Float32Array(8192);
-  private readonly fastBuf = new Float32Array(2048);
-  private inFast!: AnalyserNode;
+  private readonly probeBuf = new Float32Array(16384);
+  private inProbe!: AnalyserNode;
   private inHist: number[] = [];
-  private pinned = 0;
   private breakUntil = 0;
   private nextProbe = 0;
   private probing = false;
   private probeGap = 2;   // seconds between probes; doubles while a held note keeps proving clean
   private breaks: number[] = [];
   loopHold = false;   // stays reduced after repeated loops, until the user resets
+  private holdDb = -12;
 
   private level(an: AnalyserNode, buf: Float32Array<ArrayBuffer>): { peak: number; rms: number } {
     an.getFloatTimeDomainData(buf);
@@ -904,48 +977,53 @@ export class Engine {
     this.loopKill.gain.cancelScheduledValues(now);
     this.loopKill.gain.setTargetAtTime(dbToLin(-24), now, 0.004);
     if (this.breaks.length >= 2) {
+      if (this.loopHold) this.holdDb = Math.max(-36, this.holdDb - 6);   // still looping: push it down further
       this.loopHold = true;
-      this.onStatus('howl-repeat', 'Feedback keeps coming back: output held 12 dB lower and PHONE SAFE switched on. Use headphones, turn the speaker away from the mic, or lower MASTER.');
+      this.onStatus('howl-repeat', `Feedback keeps coming back: output held ${-this.holdDb} dB lower and PHONE SAFE switched on. Use headphones, turn the speaker away from the mic, or lower MASTER. RESET GUARD when fixed.`);
     } else {
       this.onStatus('howl', `Feedback loop stopped (${reason}).`);
     }
   }
 
-  // Robust probe: 42 ms windows (longer than a bass cycle), quietest of three
-  // readings before the dip vs loudest during it — level wobble can't fake a drop.
+  // The probe is judged on the audio clock, not on JS timers: a 340 ms history of
+  // the input is read after the dip, and the level just before the dip is
+  // compared with the level inside it. A busy main thread can't make it miss.
   private probe(): void {
     this.probing = true;
-    const read = (): number => this.level(this.inFast, this.fastBuf).rms;
-    const base: number[] = [];
-    const takeBase = (): void => {
-      base.push(read());
-      if (base.length < 3) { window.setTimeout(takeBase, 15); return; }
-      const t0 = this.ctx.currentTime;
-      const g = this.loopKill.gain;
-      const cur = g.value;
-      g.cancelScheduledValues(t0);
-      g.setValueAtTime(cur, t0);
-      g.linearRampToValueAtTime(cur * 0.5, t0 + 0.005);      // -6 dB for 100 ms
-      g.setValueAtTime(cur * 0.5, t0 + 0.1);
-      g.linearRampToValueAtTime(cur, t0 + 0.105);
-      const dipped: number[] = [];
-      const takeDip = (): void => {
-        dipped.push(read());
-        if (dipped.length < 2) { window.setTimeout(takeDip, 15); return; }
-        this.probing = false;
-        if (Math.min(...base) - Math.max(...dipped) > 3) { this.probeGap = 2; this.breakLoop('the input followed the output'); }
-        else this.probeGap = Math.min(16, this.probeGap * 2);   // clean: probe a held note less and less often
+    const ctx = this.ctx;
+    const t0 = ctx.currentTime + 0.03;
+    const g = this.loopKill.gain;
+    const cur = g.value;
+    g.cancelScheduledValues(ctx.currentTime);
+    g.setValueAtTime(cur, t0);
+    g.linearRampToValueAtTime(cur * 0.5, t0 + 0.005);      // -6 dB for 120 ms
+    g.setValueAtTime(cur * 0.5, t0 + 0.12);
+    g.linearRampToValueAtTime(cur, t0 + 0.125);
+    window.setTimeout(() => {
+      this.probing = false;
+      const an = this.inProbe, buf = this.probeBuf;
+      an.getFloatTimeDomainData(buf);
+      const now = ctx.currentTime, sr = ctx.sampleRate, N = buf.length;
+      const at = (t: number): number => N - Math.round((now - t) * sr);
+      const rms = (a: number, b: number): number => {
+        const i0 = at(a), i1 = at(b);
+        if (i0 < 0 || i1 > N || i1 <= i0) return NaN;
+        let sum = 0;
+        for (let i = i0; i < i1; i++) sum += buf[i] * buf[i];
+        return 10 * Math.log10(sum / (i1 - i0) + 1e-18);
       };
-      window.setTimeout(takeDip, 65);   // window now lies inside the dip (+ room delay)
-    };
-    takeBase();
+      const before = rms(t0 - 0.1, t0), during = rms(t0 + 0.035, t0 + 0.12);   // allow ~30 ms of room delay
+      if (Number.isNaN(before) || Number.isNaN(during)) { this.nextProbe = now + 0.5; return; }   // read too late: retry
+      if (before - during > 3) { this.probeGap = 2; this.breakLoop('the input followed the output'); }
+      else this.probeGap = Math.min(16, this.probeGap * 2);   // clean: probe a held note less and less often
+    }, 200);
   }
 
   private loopBreaker(): void {
-    if (!this.inFast) {
-      this.inFast = this.ctx.createAnalyser();
-      this.inFast.fftSize = 2048;   // ~42 ms window
-      this.inTrim.connect(this.inFast);
+    if (!this.inProbe) {
+      this.inProbe = this.ctx.createAnalyser();
+      this.inProbe.fftSize = 16384;   // ~340 ms of input history for the probe
+      this.inTrim.connect(this.inProbe);
     }
     const now = this.ctx.currentTime;
     const out = this.level(this.guardAnalyser, this.tdBuf), inp = this.level(this.inAnalyser, this.tdBuf);
@@ -953,25 +1031,25 @@ export class Engine {
     if (this.inHist.length > 12) this.inHist.shift();
     const steadyInput = this.inHist.length >= 10 && Math.max(...this.inHist) - Math.min(...this.inHist) < 3 && inp.rms > -45;
     if (!steadyInput) this.probeGap = 2;   // the music moved: back to quick checks
-    const breaking = now < this.breakUntil;
-    // backstop: output stuck at the limiter on a steady input
-    this.pinned = out.peak > -4.5 && steadyInput ? this.pinned + 1 : 0;
-    if (!breaking && this.pinned >= 10) { this.pinned = 0; this.breakLoop('output stuck at the limiter'); return; }
-    // the probe: is the steady input actually our own output?
-    if (!breaking && !this.probing && steadyInput && out.peak > -35 && now > this.nextProbe && this.monitor.gain.value > 0.5) {
-      this.nextProbe = now + this.probeGap;
-      this.probe();
-      return;
-    }
-    if (!breaking && this.breakUntil > 0) {
+    if (now < this.breakUntil) return;           // cut in progress
+    if (this.breakUntil > 0) {                    // cut over: fade back, then probe again soon
       this.breakUntil = 0;
       this.loopKill.gain.cancelScheduledValues(now);
-      this.loopKill.gain.setTargetAtTime(this.loopHold ? dbToLin(-12) : 1, now, 1);   // fade back over ~3 s
+      this.loopKill.gain.setTargetAtTime(this.loopHold ? dbToLin(this.holdDb) : 1, now, 0.4);
+      this.nextProbe = now + 1.5;
+      this.probeGap = 2;
+      return;
+    }
+    // the probe: is the steady input actually our own output?
+    if (!this.probing && steadyInput && out.peak > -35 && now > this.nextProbe && this.monitor.gain.value > 0.5) {
+      this.nextProbe = now + this.probeGap;
+      this.probe();
     }
   }
 
   releaseLoopHold(): void {
     this.loopHold = false;
+    this.holdDb = -12;
     this.breaks = [];
     if (this.loopKill) sm(this.loopKill.gain, 1, this.ctx, 0.5);
   }

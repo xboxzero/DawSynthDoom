@@ -187,6 +187,11 @@ body.live .flow i { animation: flow 1s linear infinite; background-size: 20px 1p
 .ch-meters .ch span { position: absolute; inset: 0; display: grid; place-items: center; font: 700 10px var(--mono); mix-blend-mode: difference; color: #fff; }
 .ch-meters .ch.sel { border-color: #fff; box-shadow: inset 0 0 0 1px #fff; }
 .ch-meters .ch.dead { opacity: 0.25; }
+.steps16 { display: grid; grid-template-columns: repeat(16, 1fr); gap: 3px; margin: 6px 0 2px; }
+.steps16 i { height: 12px; border: 1px solid var(--line-2); }
+.steps16 i.beat { border-color: #888; }
+.steps16 i.on { background: #fff; border-color: #fff; }
+.final-boost { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 4px; }
 .floor { font: 500 10.5px var(--mono); color: var(--dim); margin-top: 4px; }
 .btn.mute-banner { background: #fff; color: #000; border-color: #fff; animation: pulse 1.2s infinite; }
 .panel > .btn.small { margin-top: 8px; }

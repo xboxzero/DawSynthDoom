@@ -1,7 +1,8 @@
 import { Registry, type ParamSpec } from './params';
 import { knob, fader, toggle, button, segments, drawMeter, el } from './ui';
 import { Engine, WETS, EQ_BANDS, PRE_BANDS, MOD_TYPES, IR_TYPES, INPUT_CHANNELS, faderGain, isTouchDevice, describeInputError, type BassReport, type WetId } from './engine';
-import { LFO_SHAPES, LFO_DESTS } from './dsp-params';
+import { LFO_SHAPES, LFO_DESTS, ARP_MODES } from './dsp-params';
+import { GROOVES } from './groove';
 import { EqEditor, type BandDef } from './eq';
 import { Spectrum3D, KINDS } from './spectrum3d';
 import { Pad3D } from './pad3d';
@@ -16,7 +17,7 @@ const $ = <T extends HTMLElement = HTMLElement>(s: string): T => {
   return e;
 };
 
-const STATE_KEY = 'dsd.state.v5';
+const STATE_KEY = 'dsd.state.v6';
 const STARTER = 'https://raw.githubusercontent.com/tone-3000/neural-amp-modeler-wasm/refs/heads/main/ui/public/';
 const touch = isTouchDevice();
 
@@ -48,6 +49,7 @@ const PAD_TARGETS: readonly { label: string; id: string | null }[] = [
   { label: 'DLY TIME', id: 'dly.time' }, { label: 'GLIDE', id: 'tune.glide' },
   { label: 'LFO1 DEPTH', id: 'lfo1.depth' }, { label: 'LFO1 RATE', id: 'lfo1.rate' }, { label: 'LFO2 DEPTH', id: 'lfo2.depth' },
   { label: 'MOD RATE', id: 'mod.rate' }, { label: 'MOD DEPTH', id: 'mod.depth' }, { label: 'IR MIX', id: 'ir.mix' },
+  { label: 'FIFTH', id: 'bass.fifth' }, { label: 'NOTE LEN', id: 'arp.gate' }, { label: 'LOUDNESS', id: 'final.loud' }, { label: 'HARMONICS', id: 'final.harm' },
 ];
 const padLabels = PAD_TARGETS.map((t) => t.label);
 
@@ -81,7 +83,31 @@ function defineParams(): void {
   D({ id: 'bass.drive', label: 'DRIVE', def: 0.25, unit: '%', apply: bass('drive') });
   D({ id: 'bass.attack', label: 'ATTACK', min: 0.5, max: 200, def: 3, scale: 'log', unit: 'ms', apply: bass('attack') });
   D({ id: 'bass.release', label: 'RELEASE', min: 5, max: 2000, def: 120, scale: 'log', unit: 'ms', apply: bass('release') });
-  D({ id: 'bass.level', label: 'LEVEL', max: 1.5, def: 0.8, unit: '%', apply: bass('level') });
+  D({ id: 'bass.level', label: 'LEVEL', max: 1.5, def: 1, unit: '%', apply: bass('level') });
+  D({ id: 'bass.any', label: 'ANY SIGNAL', def: 1, step: 1, apply: bass('trackAny') });
+  D({ id: 'bass.autolevel', label: 'AUTO LEVEL', def: 1, step: 1, apply: bass('autoLevel') });
+  D({ id: 'bass.rangelo', label: 'LOWEST NOTE', min: 24, max: 52, def: 28, step: 1, format: (v) => noteName(v), apply: bass('rangeLo') });
+  D({ id: 'bass.fifth', label: 'FIFTH', def: 0, unit: '%', apply: bass('fifth') });
+  // music: bass patterns locked to the tempo, and a drum groove on the same grid
+  D({ id: 'arp.mode', label: 'PATTERN', min: 0, max: ARP_MODES.length - 1, def: 0, step: 1, options: ARP_MODES, apply: bass('arpMode') });
+  D({ id: 'arp.gate', label: 'NOTE LEN', min: 0.05, max: 1, def: 0.6, unit: '%', apply: bass('arpGate') });
+  D({ id: 'arp.swing', label: 'SWING', max: 0.45, def: 0, unit: '%', apply: (v) => { if (engine.started) { engine.setBass('swing', v); applyGroove(); } } });
+  D({ id: 'arp.latch', label: 'LATCH', def: 0, step: 1, apply: bass('latch') });
+  D({ id: 'groove.pattern', label: 'DRUMS', min: 0, max: GROOVES.length - 1, def: 0, step: 1, options: GROOVES, apply: () => applyGroove() });
+  D({ id: 'groove.level', label: 'DRUM LVL', def: 0.7, unit: '%', apply: () => applyGroove() });
+  D({ id: 'groove.pump', label: 'PUMP', def: 0.4, unit: '%', apply: () => applyGroove() });
+  // envelope as a modulation source
+  D({ id: 'env.dest', label: 'ENV TARGET', min: 0, max: LFO_DESTS.length - 1, def: 0, step: 1, options: LFO_DESTS, apply: bass('envDest') });
+  D({ id: 'env.depth', label: 'ENV AMOUNT', min: -1, max: 1, def: 0.5, apply: bass('envDepth') });
+  // FINAL BOOST (after the master fader) and speaker profiles
+  const fin = live(() => engine.setFinal({ hp: reg.get('final.hp'), low: reg.get('final.low'), punch: reg.get('final.punch'), presence: reg.get('final.presence'), harm: reg.get('final.harm'), loud: reg.get('final.loud') }));
+  D({ id: 'final.low', label: 'LOW BOOST', min: -6, max: 15, def: 4, unit: 'dB', apply: fin });
+  D({ id: 'final.punch', label: 'PUNCH', min: -6, max: 12, def: 2, unit: 'dB', apply: fin });
+  D({ id: 'final.presence', label: 'PRESENCE', min: -6, max: 12, def: 2, unit: 'dB', apply: fin });
+  D({ id: 'final.harm', label: 'HARMONICS', def: 0.3, unit: '%', apply: fin });
+  D({ id: 'final.loud', label: 'LOUDNESS', min: 0, max: 18, def: 6, unit: 'dB', apply: fin });
+  D({ id: 'final.hp', label: 'SPEAKER CUT', min: 15, max: 160, def: 20, scale: 'log', unit: 'Hz', apply: fin });
+  D({ id: 'out.speaker', label: 'OUTPUT TO', min: 0, max: SPEAKERS.length - 1, def: touch ? 3 : 0, step: 1, options: SPEAKERS.map((x) => x.name), apply: (v, src) => { if (src === 'ui') applySpeaker(v); } });
   // DIRECT: your input itself, always audible even when the bass voice can't find a pitch
   D({ id: 'bass.blend', label: 'DIRECT', def: 0.3, unit: '%', apply: bass('blend') });
 
@@ -129,7 +155,7 @@ function defineParams(): void {
   });
 
   // modulation matrix: two LFOs on the bass voice (runs inside the C++ DSP)
-  D({ id: 'tempo.bpm', label: 'BPM', min: 40, max: 240, def: 120, step: 1, format: (v) => String(v), apply: () => { applyLfoRate(1); applyLfoRate(2); } });
+  D({ id: 'tempo.bpm', label: 'BPM', min: 40, max: 240, def: 110, step: 1, format: (v) => String(v), apply: (v) => { applyLfoRate(1); applyLfoRate(2); if (engine.started) { engine.setBass('bpm', v); applyGroove(); } } });
   D({ id: 'lfo.retrig', label: 'RETRIG', def: 0, step: 1, apply: bass('lfoRetrig') });
   const lfoDefs: Record<number, { rate: number; dest: number; depth: number }> = { 1: { rate: 2, dest: 1, depth: 0 }, 2: { rate: 0.3, dest: 4, depth: 0 } };
   for (const n of [1, 2]) {
@@ -179,8 +205,37 @@ function defineParams(): void {
   D({ id: 'master.comp', label: 'GLUE', def: 0.15, unit: '%', apply: live((v) => engine.setComp(v)) });
   D({ id: 'guard.on', label: 'FB GUARD', def: 1, step: 1 });
   D({ id: 'guard.sens', label: 'SENSE', def: 0.5, unit: '%' });
-  D({ id: 'master.vol', label: 'MASTER', def: 0.62, format: fmtFader, apply: live((v) => engine.master.gain.setTargetAtTime(faderGain(v), engine.ctx.currentTime, 0.015)) });
+  D({ id: 'master.vol', label: 'MASTER', def: 0.79, format: fmtFader, apply: live((v) => engine.master.gain.setTargetAtTime(faderGain(v), engine.ctx.currentTime, 0.015)) });
   D({ id: 'master.mon', label: 'MONITOR', def: 0, step: 1, persist: false, apply: live((v) => engine.monitor.gain.setTargetAtTime(v >= 0.5 ? 1 : 0, engine.ctx.currentTime, 0.01)) });
+}
+
+// Where the sound goes. Small speakers and guitar amps can't play deep bass, so those
+// profiles lift the bass into their range, add harmonics and protect the speaker.
+const SPEAKERS = [
+  { name: 'HEADPHONES', set: { 'bass.rangelo': 28, 'final.hp': 20, 'final.harm': 0.15, 'final.low': 4, 'final.punch': 1, 'final.presence': 1, 'final.loud': 6 } },
+  { name: 'PA / BASS AMP', set: { 'bass.rangelo': 28, 'final.hp': 30, 'final.harm': 0.2, 'final.low': 3, 'final.punch': 2, 'final.presence': 1, 'final.loud': 6 } },
+  { name: 'GUITAR AMP', set: { 'bass.rangelo': 40, 'final.hp': 75, 'final.harm': 0.6, 'final.low': 2, 'final.punch': 5, 'final.presence': 1, 'final.loud': 8 } },
+  { name: 'PHONE / LAPTOP', set: { 'bass.rangelo': 40, 'final.hp': 110, 'final.harm': 0.9, 'final.low': 0, 'final.punch': 6, 'final.presence': 3, 'final.loud': 10 } },
+] as const;
+
+function applySpeaker(i: number): void {
+  const sp = SPEAKERS[Math.round(i)];
+  if (!sp) return;
+  for (const [id, v] of Object.entries(sp.set)) reg.set(id, v, 'ui');
+  toast(`Output: ${sp.name}${i >= 2 ? ' — bass lifted into the speaker\'s range, harmonics added' : ''}`);
+}
+
+function applyGroove(): void {
+  if (!engine.started) return;
+  engine.groove.set(GROOVES[Math.round(reg.get('groove.pattern'))] ?? 'OFF', reg.get('tempo.bpm'), reg.get('arp.swing'), reg.get('groove.level'), reg.get('groove.pump'));
+}
+
+let taps: number[] = [];
+function tapTempo(): void {
+  const t = performance.now();
+  taps = taps.filter((x) => t - x < 2500);
+  taps.push(t);
+  if (taps.length >= 3) reg.set('tempo.bpm', Math.round(60000 / ((taps[taps.length - 1] - taps[0]) / (taps.length - 1))));
 }
 
 // tempo divisions in beats: [label, beats]
@@ -247,6 +302,8 @@ function buildInput(): void {
   const tg = el('div', 'p-btns', host);
   toggle(tg, reg, 'in.auto', { text: 'AUTO CHANNEL', cls: 'small', title: 'Switch to the input that has signal' });
   toggle(tg, reg, 'bass.autogate', { text: 'AUTO GATE', cls: 'small', title: 'Learn the noise floor and keep the gate above it' });
+  toggle(tg, reg, 'bass.any', { text: 'ANY SIGNAL', cls: 'small', title: 'Unpitched sounds (drums, noise, voice) also play bass notes in key' });
+  toggle(tg, reg, 'bass.autolevel', { text: 'AUTO LEVEL', cls: 'small', title: 'Full bass level from any input level' });
   el('div', 'floor', host).id = 'floorInfo';
   const st = el('div', 'in-status', host);
   st.id = 'inStatus';
@@ -288,6 +345,12 @@ function buildLfos(): void {
   const h = head(host, 'MODULATION', 'two LFOs on the bass voice');
   toggle(h, reg, 'lfo.retrig', { text: 'RETRIG ON NOTE', cls: 'small' });
   knob(h, reg, 'tempo.bpm');
+  const envCard = el('div', 'lfo-card', host);
+  el('span', 's-name', el('div', 'lfo-head', envCard)).textContent = 'ENVELOPE';
+  el('p', 'hint', envCard).textContent = 'Your playing dynamics as a modulation source: harder = more.';
+  knobs(envCard, ['env.depth']);
+  el('div', 'l-title', envCard).textContent = 'TARGET';
+  segments(envCard, reg, 'env.dest');
   for (const n of [1, 2]) {
     const card = el('div', 'lfo-card', host);
     const ch = el('div', 'lfo-head', card);
@@ -301,6 +364,24 @@ function buildLfos(): void {
     el('div', 'l-title', card).textContent = 'TARGET';
     segments(card, reg, `lfo${n}.dest`);
   }
+}
+
+function buildMusic(): void {
+  const host = $('#music');
+  const h = head(host, 'MUSIC', 'patterns stay in key + temperament');
+  knob(h, reg, 'tempo.bpm');
+  button(h, 'TAP', () => tapTempo(), 'small');
+  const steps = el('div', 'steps16', host);
+  steps.id = 'steps16';
+  for (let i = 0; i < 16; i++) el('i', i % 4 === 0 ? 'beat' : '', steps);
+  el('div', 'l-title', host).textContent = 'BASS PATTERN';
+  segments(host, reg, 'arp.mode');
+  const r = el('div', 'p-btns', host);
+  toggle(r, reg, 'arp.latch', { text: 'LATCH', cls: 'small', title: 'Keep the pattern playing after you stop' });
+  knobs(host, ['arp.gate', 'arp.swing', 'bass.fifth']);
+  el('div', 'l-title', host).textContent = 'DRUMS';
+  segments(host, reg, 'groove.pattern');
+  knobs(host, ['groove.level', 'groove.pump']);
 }
 
 function buildIrSim(): void {
@@ -329,7 +410,7 @@ function buildTuning(): void {
 function buildVoice(): void {
   const host = $('#voice');
   head(host, 'BASS VOICE', 'follows your synth');
-  knobs(host, ['bass.shape', 'bass.sub', 'bass.fold', 'bass.noise', 'bass.cutoff', 'bass.reso', 'bass.env', 'bass.drive', 'bass.attack', 'bass.release', 'bass.level']);
+  knobs(host, ['bass.shape', 'bass.sub', 'bass.fold', 'bass.noise', 'bass.cutoff', 'bass.reso', 'bass.env', 'bass.drive', 'bass.attack', 'bass.release', 'bass.fifth', 'bass.level']);
 }
 
 function buildAmp(): void {
@@ -491,6 +572,11 @@ function buildMaster(): void {
   knobs(g, ['guard.sens', 'master.comp']);
   el('div', 'g-list', g).id = 'guardList';
   button(g, 'RESET GUARD', () => engine.resetGuard(), 'ghost small');
+  const fb = el('div', 'final-boost', host);
+  el('div', 'l-title', fb).textContent = 'FINAL BOOST (after the master, into the limiter)';
+  el('div', 'l-title', fb).textContent = 'OUTPUT TO';
+  segments(fb, reg, 'out.speaker');
+  knobs(fb, ['final.low', 'final.punch', 'final.presence', 'final.harm', 'final.loud', 'final.hp']);
   const vol = el('div', 'm-vol', side);
   const f = fader(vol, reg, 'master.vol');
   f.root.classList.add('big');
@@ -721,10 +807,13 @@ function t3kPick(kind: 'amp' | 'nam' | 'ir'): void {
 // ───────────────────────── presets + persistence ─────────────────────────
 const PRESETS: Record<string, Record<string, number>> = {
   'Deep Sub': { 'bass.shape': 0.55, 'bass.sub': 0.9, 'bass.cutoff': 180, 'bass.reso': 0.1, 'bass.env': 0.2, 'bass.drive': 0.15, 'bass.fold': 0, 'tune.octave': -1, 'pad.mode': 0, 'wdw.wet': 0.3 },
-  'Acid Line': { 'bass.shape': 0, 'bass.sub': 0.2, 'bass.cutoff': 220, 'bass.reso': 0.82, 'bass.env': 0.85, 'bass.drive': 0.55, 'tune.glide': 60, 'tune.octave': 0, 'pad.tx': 1, 'pad.ty': 2, 'pad.mode': 1, 'pad.speed': 0.25 },
-  'Fold Growl': { 'bass.shape': 0.3, 'bass.sub': 0.5, 'bass.fold': 0.6, 'bass.cutoff': 900, 'bass.reso': 0.4, 'bass.drive': 0.6, 'pad.tx': 4, 'pad.ty': 1, 'pad.mode': 2, 'pad.speed': 0.4, 'chaos.entropy': 0.5 },
-  'Dub Space': { 'bass.shape': 0.55, 'bass.sub': 0.7, 'bass.cutoff': 300, 'dly.send': 0.7, 'dly.fb': 0.6, 'dly.time': 0.5, 'rev.send': 0.65, 'rev.size': 4.5, 'wdw.wet': 0.8, 'pad.tz': 8, 'pad.mode': 1, 'pad.speed': 0.08 },
-  'Clean Tempered': { 'bass.shape': 0.15, 'bass.sub': 0.4, 'bass.fold': 0, 'bass.cutoff': 1200, 'bass.reso': 0.2, 'bass.env': 0.3, 'bass.drive': 0.1, 'tune.quant': 1, 'tune.glide': 5, 'pad.mode': 0, 'wdw.wet': 0.45 },
+  'Disco Octaves': { 'arp.mode': 5, 'groove.pattern': 1, 'tempo.bpm': 118, 'bass.shape': 0.1, 'bass.cutoff': 700, 'bass.reso': 0.3, 'bass.env': 0.5, 'arp.gate': 0.5, 'groove.pump': 0.5, 'wdw.wet': 0.4 },
+  'Acid Line': { 'arp.mode': 6, 'groove.pattern': 1, 'tempo.bpm': 128, 'bass.shape': 0, 'bass.sub': 0.2, 'bass.cutoff': 220, 'bass.reso': 0.82, 'bass.env': 0.85, 'bass.drive': 0.55, 'tune.glide': 45, 'arp.gate': 0.7, 'lfo1.depth': 0.4, 'lfo1.sync': 1, 'lfo1.div': 0, 'lfo1.dest': 1 },
+  'Dub Steppers': { 'arp.mode': 7, 'groove.pattern': 5, 'tempo.bpm': 140, 'bass.shape': 0.55, 'bass.sub': 0.8, 'bass.cutoff': 300, 'dly.send': 0.7, 'dly.fb': 0.55, 'rev.send': 0.6, 'arp.gate': 0.9, 'groove.pump': 0.3 },
+  'Rock Gallop': { 'arp.mode': 8, 'groove.pattern': 2, 'tempo.bpm': 150, 'bass.shape': 0.3, 'bass.drive': 0.6, 'bass.cutoff': 900, 'bass.fifth': 0.4, 'arp.gate': 0.55 },
+  'Walking Jazz': { 'arp.mode': 4, 'groove.pattern': 3, 'tempo.bpm': 96, 'arp.swing': 0.3, 'bass.shape': 0.55, 'bass.sub': 0.4, 'bass.cutoff': 500, 'bass.drive': 0.1, 'arp.gate': 0.85, 'tune.temper': 3 },
+  'Wobble': { 'arp.mode': 1, 'groove.pattern': 3, 'tempo.bpm': 140, 'bass.shape': 0.2, 'bass.cutoff': 200, 'bass.reso': 0.6, 'lfo1.depth': 0.8, 'lfo1.sync': 1, 'lfo1.div': 3, 'lfo1.dest': 1, 'bass.drive': 0.5, 'bass.fold': 0.3 },
+  'Sand Dune Drone': { 'arp.mode': 0, 'bass.shape': 0.6, 'bass.sub': 0.7, 'bass.cutoff': 260, 'ir.on': 1, 'ir.type': 7, 'ir.mix': 0.55, 'lfo2.depth': 0.3, 'lfo2.shape': 5, 'lfo2.rate': 0.1, 'lfo2.dest': 4, 'bass.fifth': 0.3 },
 };
 
 const persistSnap = (): Record<string, number> => reg.snapshot((p) => p.persist && !/^r\d+\./.test(p.id));
@@ -906,6 +995,8 @@ function frame(): void {
 }
 
 function onBass(d: BassReport): void {
+  const st = document.getElementById('steps16');
+  if (st) st.querySelectorAll('i').forEach((el2, i) => el2.classList.toggle('on', i === d.step));
   const fi = document.getElementById('floorInfo');
   if (fi) {
     const floorDb = 20 * Math.log10(d.floor + 1e-9);
@@ -947,6 +1038,7 @@ buildMaster();
 buildPreEq();
 buildLfos();
 buildIrSim();
+buildMusic();
 buildPresets();
 loadState();
 renderRack();

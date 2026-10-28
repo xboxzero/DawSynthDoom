@@ -7,15 +7,18 @@ export const DSP_PARAMS = [
   ['shape', 0.2, 0, 1], ['sub', 0.5, 0, 1], ['noise', 0, 0, 0.5], ['blend', 0, 0, 1],
   ['cutoff', 400, 30, 12000], ['reso', 0.35, 0, 1], ['envAmt', 0.5, 0, 1], ['drive', 0.25, 0, 1],
   ['fold', 0, 0, 1], ['attack', 3, 0.5, 200], ['release', 120, 5, 2000], ['level', 0.8, 0, 1.5],
-  ['l1Rate', 2, 0.01, 40], ['l1Shape', 0, 0, 5], ['l1Depth', 0, 0, 1], ['l1Dest', 1, 0, 8],
-  ['l2Rate', 0.3, 0.01, 40], ['l2Shape', 0, 0, 5], ['l2Depth', 0, 0, 1], ['l2Dest', 4, 0, 8],
+  ['l1Rate', 2, 0.01, 40], ['l1Shape', 0, 0, 8], ['l1Depth', 0, 0, 1], ['l1Dest', 1, 0, 12],
+  ['l2Rate', 0.3, 0.01, 40], ['l2Shape', 0, 0, 8], ['l2Depth', 0, 0, 1], ['l2Dest', 4, 0, 12],
   ['lfoRetrig', 0, 0, 1],
   ['autoGate', 1, 0, 1],
+  ['rangeLo', 28, 24, 52], ['trackAny', 1, 0, 1], ['autoLevel', 1, 0, 1], ['envDest', 0, 0, 12], ['envDepth', 0, -1, 1],
+  ['arpMode', 0, 0, 9], ['bpm', 120, 40, 240], ['arpGate', 0.6, 0.05, 1], ['swing', 0, 0, 0.45], ['latch', 0, 0, 1], ['fifth', 0, 0, 1],
 ] as const;
 
 export type DspParam = (typeof DSP_PARAMS)[number][0];
 
-export interface BassReport { f0: number; out: number; midi: number; cents: number; err: number; amp: number; gate: boolean; lfo1: number; lfo2: number; floor: number; locked: boolean }
+export interface BassReport { f0: number; out: number; midi: number; cents: number; err: number; amp: number; gate: boolean; lfo1: number; lfo2: number; floor: number; locked: boolean; step: number; any: boolean }
 
-export const LFO_SHAPES = ['SINE', 'TRI', 'SAW', 'SQUARE', 'S&H', 'SMOOTH'] as const;
-export const LFO_DESTS = ['NONE', 'CUTOFF', 'PITCH', 'AMP', 'FOLD', 'SHAPE', 'DRIVE', 'RESO', 'SUB'] as const;
+export const LFO_SHAPES = ['SINE', 'TRI', 'SAW UP', 'SQUARE', 'S&H', 'SMOOTH', 'SAW DN', 'PLUCK', 'STAIRS'] as const;
+export const LFO_DESTS = ['NONE', 'CUTOFF', 'PITCH', 'AMP', 'FOLD', 'SHAPE', 'DRIVE', 'RESO', 'SUB', 'NOISE', 'OCTAVE', 'DIRECT', 'FIFTH'] as const;
+export const ARP_MODES = ['OFF', 'ROOT 8THS', 'OCTAVES', 'ROOT-5TH', 'WALKING', 'DISCO', 'ACID', 'DUB', 'GALLOP', 'RANDOM'] as const;
